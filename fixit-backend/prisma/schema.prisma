@@ -1,0 +1,198 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                String             @id @default(uuid(7)) @db.Uuid // @db.Uuid stores this as a native PostgreSQL UUID
+  email             String             @unique // Normalised to lowercase before it reaches the database
+  username          String             @unique // Normalised to lowercase before it reaches the database
+  passwordHash      String // bcrypt hash only; the plaintext password is never stored
+  appliances        Appliance[]
+  diagnosisSessions DiagnosisSession[]
+  refreshTokens     RefreshToken[]
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+}
+
+// Opaque refresh tokens are stored as SHA-256 hashes so a database leak cannot
+// be replayed as a login. Rotating a token revokes the old row and creates a new
+// one in the same family; replaying any used token revokes the whole family.
+model RefreshToken {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  userId    String    @db.Uuid
+  familyId  String    @db.Uuid // shared by every token produced by one login/rotation chain
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+enum ApplianceCategory {
+  WASHING_MACHINE
+  REFRIGERATOR
+}
+
+model Appliance {
+  id                String             @id @default(uuid(7)) @db.Uuid
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  userId            String             @db.Uuid
+  diagnosisSessions DiagnosisSession[]
+  category          ApplianceCategory
+  brand             String
+  modelNumber       String?
+  nickname          String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+}
+
+// Knowledge source types
+
+enum SourceKind {
+  MANUAL
+  MANUFACTURER_PAGE
+  OTHER
+  TEST_FIXTURE
+}
+
+model KnowledgeSource {
+  id          String       @id @default(uuid(7)) @db.Uuid
+  errorCodes  ErrorCode[]
+  repairSteps RepairStep[]
+  title       String
+  kind        SourceKind
+  url         String?
+  edition     String?
+  capturedAt  DateTime
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
+enum ReviewStatus {
+  UNREVIEWED
+  APPROVED
+  REJECTED
+}
+
+model ErrorCode {
+  id                String                @id @default(uuid(7)) @db.Uuid
+  source            KnowledgeSource       @relation(fields: [sourceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  sourceId          String                @db.Uuid
+  diagnosisSessions DiagnosisSession[]
+  repairStepLinks   ErrorCodeRepairStep[]
+  category          ApplianceCategory
+  brand             String
+  code              String
+  modelScope        String // Required; use UNSPECIFIED when model applicability is unknown
+  meaning           String
+  reviewStatus      ReviewStatus          @default(UNREVIEWED)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  @@unique([category, brand, code, modelScope])
+  @@index([sourceId])
+}
+
+enum SafetyClass {
+  USER_SAFE
+  TECHNICIAN_ONLY
+}
+
+enum Difficulty {
+  EASY
+  MODERATE
+  HARD
+}
+
+model RepairStep {
+  id             String                @id @default(uuid(7)) @db.Uuid
+  source         KnowledgeSource       @relation(fields: [sourceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  errorCodeLinks ErrorCodeRepairStep[]
+  sourceId       String                @db.Uuid
+  instruction    String
+  safetyClass    SafetyClass
+  difficulty     Difficulty?
+  reviewStatus   ReviewStatus          @default(UNREVIEWED)
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  @@index([sourceId])
+}
+
+model ErrorCodeRepairStep {
+  errorCodeId  String @db.Uuid
+  repairStepId String @db.Uuid
+
+  errorCode  ErrorCode  @relation(fields: [errorCodeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  repairStep RepairStep @relation(fields: [repairStepId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  position     Int
+  reviewStatus ReviewStatus @default(UNREVIEWED)
+
+  @@id([errorCodeId, repairStepId])
+  @@unique([errorCodeId, position])
+}
+
+enum SessionStatus {
+  OPEN
+  COMPLETED
+  ABANDONED
+}
+
+enum Verdict {
+  FIXED
+  NEEDS_PART
+  CALL_TECHNICIAN
+}
+
+model DiagnosisSession {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  applianceId String?    @db.Uuid
+  appliance   Appliance? @relation(fields: [applianceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  errorCodeId String?    @db.Uuid
+  errorCode   ErrorCode? @relation(fields: [errorCodeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  symptom String?
+  status  SessionStatus @default(OPEN)
+  verdict Verdict?
+
+  messages Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([applianceId])
+  @@index([errorCodeId])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+model Message {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  sessionId String           @db.Uuid
+  session   DiagnosisSession @relation(fields: [sessionId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  role      MessageRole
+  content   String
+  createdAt DateTime    @default(now())
+
+  @@index([sessionId])
+}
