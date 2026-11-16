@@ -150,7 +150,8 @@ enum SessionStatus {
 enum Verdict {
   FIXED
   NEEDS_PART
-  CALL_TECHNICIAN
+  TECHNICIAN_REQUIRED
+  UNRESOLVED
 }
 
 model DiagnosisSession {
@@ -168,6 +169,12 @@ model DiagnosisSession {
   symptom String?
   status  SessionStatus @default(OPEN)
   verdict Verdict?
+
+  // Server-managed, single-use challenge for explicit FIXED confirmation.
+  // The backend issues, validates, and clears this; it is never client-authored.
+  fixConfirmationChallengeId String?
+  fixConfirmationIssuedAt    DateTime?
+  fixConfirmationExpiresAt   DateTime?
 
   messages Message[]
 

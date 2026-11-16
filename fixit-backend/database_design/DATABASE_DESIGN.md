@@ -3,6 +3,15 @@
 > hashed, rotating refresh tokens grouped by `familyId` for replay detection. Password
 > change rehashes the password and revokes every active refresh token for the user. The
 > anonymous-token discussion further down is kept as historical design context.
+>
+> **Update 2026-11-16 (Phase 1):** `Verdict` is now
+> `FIXED, NEEDS_PART, TECHNICIAN_REQUIRED, UNRESOLVED`; the migration renames
+> `CALL_TECHNICIAN` to `TECHNICIAN_REQUIRED` in place and adds `UNRESOLVED`.
+> `DiagnosisSession` now persists a server-managed, single-use `FIXED` confirmation
+> challenge via `fixConfirmationChallengeId`, `fixConfirmationIssuedAt`, and
+> `fixConfirmationExpiresAt`. The migration
+> `20261116093023_verdict_pending_confirmation` was generated, reviewed, and applied to the
+> development branch on 2026-11-16; `prisma migrate status` now reports the schema up to date.
 
 erDiagram
     %% ============================================================
@@ -17,7 +26,7 @@ erDiagram
     %%   SafetyClass       : USER_SAFE, TECHNICIAN_ONLY
     %%   Difficulty        : EASY, MODERATE, HARD
     %%   SessionStatus     : OPEN (default), COMPLETED, ABANDONED
-    %%   Verdict           : FIXED, NEEDS_PART, CALL_TECHNICIAN
+    %%   Verdict           : FIXED, NEEDS_PART, TECHNICIAN_REQUIRED, UNRESOLVED
     %%   MessageRole       : USER, ASSISTANT
 
     %% ---------------- Relationships ----------------
@@ -124,6 +133,9 @@ erDiagram
         string symptom "nullable"
         SessionStatus status "default OPEN"
         Verdict verdict "nullable"
+        string fixConfirmationChallengeId "nullable, server-managed"
+        datetime fixConfirmationIssuedAt "nullable, server-managed"
+        datetime fixConfirmationExpiresAt "nullable, server-managed"
         datetime createdAt
         datetime updatedAt
     }
@@ -211,7 +223,7 @@ KnowledgeSource	Where a fact came from	Kind includes TEST_FIXTURE. Can’t be de
 ErrorCode	What a code means	Unique on (category, brand, code, modelScope). modelScope required, UNSPECIFIED if unknown. Source required.
 RepairStep	An approved action	Safety class USER_SAFE or TECHNICIAN_ONLY. Source required.
 ErrorCodeRepairStep	Ordered steps per code	Composite key (errorCodeId, repairStepId). position unique per code. Own review status.
-DiagnosisSession	One troubleshooting conversation	Appliance and error code optional. An error code in use can’t be deleted.
+DiagnosisSession	One troubleshooting conversation	Appliance and error code optional. An error code in use can’t be deleted. Nullable server-managed `fixConfirmation*` fields hold the single-use FIXED confirmation challenge.
 Message	A chat message	Belongs to a session and is deleted with it.
 
 Cross-cutting decisions
@@ -221,6 +233,7 @@ Review: new rows start UNREVIEWED. Edits reset review in the knowledge-writing m
 Safety: retrieval filter, structured Groq output limited to candidate IDs, a re-check before responding, and instruction text taken from the database.
 Test data: TEST_FIXTURE sources, a separate dev database, and seed guardrails. No mock data is added yet.
 Identity: email/password authentication is implemented. Passwords are bcrypt hashes; access tokens are short-lived HS256 JWTs; refresh tokens are opaque, hashed at rest, rotated on every use, and grouped into families so replaying a used token revokes the whole chain. Password change revokes all active refresh tokens.
+Verdicts: final verdicts are FIXED, NEEDS_PART, TECHNICIAN_REQUIRED and UNRESOLVED. FIXED requires a backend-validated, single-use confirmation challenge persisted on the session; the backend alone sets the verdict. Status and verdict remain separate.
 
 Deliberately deferred: appliance model and family tables, a review record (who approved, from what source), diagnosis state tracking, steps for problems without error codes, email verification, password reset, rate limiting, push tokens, subscriptions and image storage. APPROVED is not trustworthy for safety until the review record exists.
 
