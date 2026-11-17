@@ -1,6 +1,6 @@
 # fixit-backend — Project Context
 
-Last analyzed: 2026-11-16
+Last analyzed: 2026-11-17
 Repository: `D:\fixit` (monorepo-ish: Expo app at root, API in `fixit-backend/`)
 
 ## 1. What this is
@@ -24,8 +24,10 @@ out and not yet wired in.
 | Database       | PostgreSQL (Neon), via Prisma 7.10.1 + `@prisma/adapter-pg` driver adapter |
 | Validation     | Zod 4 (env vars and request bodies)                                 |
 | Auth           | `bcryptjs` password hashes, `jsonwebtoken` access tokens, opaque hashed refresh tokens |
+| AI provider    | `groq-sdk` 1.6 installed; adapter/tool loop not implemented and no calls made yet |
 | Dev runner     | `tsx watch`                                                         |
-| Tests / lint   | **None configured** (`npm test` is a placeholder)                    |
+| Tests          | Vitest 5 + Vite 8 + Supertest 7 (`npm test` = `vitest run`)          |
+| Lint / format  | **None configured**                                                 |
 
 Pinned: `prisma`, `@prisma/client`, `@prisma/adapter-pg` all at **7.10.1** — keep them in
 lockstep. Prisma 8 renames `@default(uuid(7))` to `@onCreate(uuid(7))`; do not upgrade
@@ -38,6 +40,13 @@ fixit-backend/
 ├─ .env                  # secrets, gitignored
 ├─ .env.example          # documents every required variable
 ├─ prisma.config.ts      # Prisma CLI config (schema path, migrations, DIRECT_URL)
+├─ vitest.config.ts      # Vitest config: node env, tests/**/*.test.ts, envDir false
+├─ tsconfig.test.json    # typecheck src + tests + vitest.config.ts (noEmit)
+├─ tests/
+│  ├─ setup-env.ts       # refuses NODE_ENV=production; sets dummy env before imports
+│  ├─ config/env.test.ts # env schema + production guard tests
+│  ├─ http/app.test.ts   # Supertest smoke tests (no database)
+│  └─ dependencies/groq-sdk.test.ts # ESM import/construction only, no network
 ├─ prisma/
 │  ├─ schema.prisma      # 9 models, 8 enums
 │  └─ migrations/
@@ -52,7 +61,8 @@ fixit-backend/
    ├─ server.ts                  # boots app, listens on env.PORT
    ├─ app.ts                     # express app, middleware + route mounting
    ├─ config/
-   │  ├─ env.ts                  # Zod-validated env, exits process on failure
+   │  ├─ env.schema.ts           # pure Zod env schema + parseEnv (testable guards)
+   │  ├─ env.ts                  # loads dotenv, validates process.env, exits on failure
    │  ├─ prisma.ts               # single PrismaClient instance w/ pg adapter
    │  └─ database.ts             # checkDatabase() -> SELECT 1
    ├─ routes/
@@ -89,8 +99,10 @@ fixit-backend/
 ```
 
 `src/app.ts` mounts `/health` and `/auth`; it still does **not** import
-`routes/diagnosis.routes.ts`, so diagnosis is not live. `postinstall`/generate is not
-scripted; run `prisma generate` after a fresh clone (see §7).
+`routes/diagnosis.routes.ts`, so diagnosis is not live. The working tree also mounts an
+uncommitted Swagger `/docs` router (`src/docs/**`); that pre-existing work is preserved
+untouched and is not part of Phase 2. `postinstall`/generate is not scripted; run
+`prisma generate` after a fresh clone (see §7).
 
 ## 4. Request lifecycle
 
@@ -98,8 +110,9 @@ scripted; run `prisma generate` after a fresh clone (see §7).
 1. `express.json()` body parser
 2. `app.use("/health", healthRouter)`
 3. `app.use("/auth", authRouter)`
-4. `notFound` → `{ success:false, error:{ code:"NOT_FOUND", message:"Route not found" } }`, 404
-5. `errorHandler` → expected failures thrown as `HttpError` keep their status/code;
+4. `app.use("/docs", docsRouter)` — uncommitted Swagger UI/OpenAPI JSON work, working tree only
+5. `notFound` → `{ success:false, error:{ code:"NOT_FOUND", message:"Route not found" } }`, 404
+6. `errorHandler` → expected failures thrown as `HttpError` keep their status/code;
    unknown errors log their stack server-side and return `INTERNAL_ERROR` / 500. Never leaks
    internals. If headers were already sent it delegates back to Express.
 
@@ -195,14 +208,25 @@ Enums: `ApplianceCategory` (WASHING_MACHINE, REFRIGERATOR), `SourceKind`, `Revie
 
 | Var            | Used by                                | Notes |
 | -------------- | -------------------------------------- | ----- |
-| `NODE_ENV`     | `src/config/env.ts`                    | `development` *(default)* / `test` / `production` |
-| `PORT`         | `src/config/env.ts` → `server.ts`      | default `3000`, coerced to int 1–65535 |
+| `NODE_ENV`     | `src/config/env.ts`                    | **required, no default**: `development` / `test` / `production`. Production additionally enforces the Groq and unreviewed-knowledge guards below |
+| `PORT`         | `src/config/env.ts` → `server.ts`      | default `3000`; supplied values coerced to int 1–65535 |
 | `DATABASE_URL` | `src/config/prisma.ts` (runtime); required by `src/scripts/seed.ts` for host validation | must be `postgres://` or `postgresql://`; pooled runtime connection. Local `.env` points to the development branch |
 | `DIRECT_URL`   | `prisma.config.ts` (migrations/introspection) and `src/scripts/seed.ts` (seed connection) | direct/session connection. Local `.env` points to the development branch |
 | `SEED_TARGET`  | `src/scripts/seed.ts`                  | must be exactly `development`; the seed aborts if missing or different |
 | `JWT_ACCESS_SECRET` | `src/config/env.ts` → `token.service.ts` | **required**, minimum 32 characters; changing it invalidates every access token |
 | `ACCESS_TOKEN_TTL_SECONDS` | `src/config/env.ts` → `token.service.ts` | default `900` (15 min), allowed 60–86400 |
 | `REFRESH_TOKEN_TTL_DAYS` | `src/config/env.ts` → `token.service.ts` | default `30`, allowed 1–365 |
+| `GROQ_API_KEY` | `src/config/env.schema.ts`; future AI service | backend-only credential; optional in development/test, **required in production**; empty/whitespace counts as absent; never logged |
+| `GROQ_MODEL`   | `src/config/env.schema.ts`; future AI service | tool-capable model id; default `openai/gpt-oss-120b`, non-empty override allowed |
+| `ALLOW_UNREVIEWED_KNOWLEDGE` | `src/config/env.schema.ts`; future knowledge service | development-only switch; default `false`; accepts exactly `true`/`false`; **startup failure when `NODE_ENV=production`** |
+
+Configuration is split so the rules are testable: `env.schema.ts` is a pure Zod schema plus
+`parseEnv(raw)` with no dotenv, logging, or process exit; `env.ts` loads dotenv, validates
+`process.env`, prints only variable names/messages (never values), and exits `1` on failure.
+`server.ts` imports `env` before `app` so invalid configuration fails before the app or
+database client is constructed. Deferred until their implementation phases:
+`GROQ_TIMEOUT_MS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_TOOL_ROUNDS`,
+`FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER`.
 
 Gotcha: env validation in `env.ts` validates the application vars above; `SEED_TARGET` is
 read only by the seed and is not part of that schema. `prisma.ts` reads
@@ -222,9 +246,12 @@ Run everything from `fixit-backend/`.
 
 ```bash
 npm run dev              # tsx watch src/server.ts
-npm run build            # tsc -> dist/
+npm run build            # tsc -> dist/ (tests are excluded)
 npm start                # node dist/server.js (requires build first)
 npm run typecheck        # tsc --noEmit  (currently passes clean)
+npm run typecheck:test   # typecheck src + tests + vitest.config.ts
+npm test                 # vitest run (one-shot, CI-style)
+npm run test:watch       # vitest watch mode
 npm run db:seed          # tsx src/scripts/seed.ts (requires SEED_TARGET=development; uses DIRECT_URL)
 
 npx prisma generate                        # rebuild src/generated/prisma (needed after clone)
@@ -233,6 +260,10 @@ npx prisma migrate deploy                  # apply in CI/production
 npx prisma studio                          # browse data
 npx tsx src/scripts/test-prisma.ts         # one-off connection smoke test
 ```
+
+Tests currently cover the environment schema/guards, HTTP routing/envelope smoke checks, and
+Groq SDK ESM import/construction. They use dummy credentials, make no database connection,
+and make no network/AI calls. `tests/setup-env.ts` refuses to run when `NODE_ENV=production`.
 
 ## 8. Conventions observed in the code
 
@@ -294,6 +325,17 @@ exist and are nullable, and `_prisma_migrations` records the migration as finish
 and diagnosis code and behaviour are untouched. Phase 1 was explicitly approved by the
 user on 2026-11-16.
 
+Phase 2 (2026-11-16) added the environment, dependency, and test-harness foundation:
+`groq-sdk` 1.6 plus Vitest 5/Vite 8/Supertest 7; a pure `env.schema.ts`; required
+`NODE_ENV`; `GROQ_API_KEY`, `GROQ_MODEL`, and `ALLOW_UNREVIEWED_KNOWLEDGE`; startup
+guards that reject production without a Groq key and reject unreviewed knowledge in
+production; and a Node/environment test config. `npm test` now runs `vitest run` and
+passes 14 tests in 3 files; `npm run typecheck`, `npm run typecheck:test`, `npm run build`,
+and `npx prisma validate` also pass. Tests use dummy credentials and make no database or
+network/AI calls. No schema, migration, seed, diagnosis code, Swagger file, or database
+record was changed. Phase 2 is implemented and tested (2026-11-16) and was explicitly
+**approved by the user on 2026-11-17**.
+
 Knowledge-base read-only audit and scoped approval (2026-11-16, development Neon only):
 
 - **Audit (read-only, no changes):** Step 1 standalone audit of actual development Neon DB records (dev host `ep-shy-glade-a1uvm947.ap-southeast-1.aws.neon.tech`, `prodLike=false`). No production DB accessed. No schema, migrations, seed, or application code modified. Artifacts: `C:\Users\Sonic\AppData\Local\Temp\opencode\audit_report.md`, `C:\Users\Sonic\AppData\Local\Temp\opencode\audit_analysis.json`, `C:\Users\Sonic\AppData\Local\Temp\opencode\audit_kb.json`. Counts audited (all `UNREVIEWED` before update): 15 `KnowledgeSource`, 77 `ErrorCode` (22 explicitly scoped `TOP_LOAD`/`FRONT_LOAD`/`FRENCH_DOOR_BOTTOM_FREEZER`, 55 `UNSPECIFIED`), 117 `RepairStep` (74 `USER_SAFE`, 43 `TECHNICIAN_ONLY`), 188 `ErrorCodeRepairStep`.
@@ -312,8 +354,8 @@ Open work, roughly in dependency order:
    still not `diagnosisRouter`.
 3. **All five diagnosis/knowledge services are empty placeholders** — `knowledge`
    (retrieval + review rules), `diagnosis` (orchestration), `ai` (LLM call), `session`
-   (persistence), `appliance-scan` (image → appliance/error code). No AI provider SDK is
-   installed yet (design mentions Groq with structured output limited to candidate IDs).
+   (persistence), `appliance-scan` (image → appliance/error code). `groq-sdk` is installed
+   and import-verified, but no AI client code, tool loop, or API call exists yet.
 4. **Validation middleware exists for auth only.** Reuse `validateBody` and create
    schema-per-route validators before writing the diagnosis controller.
 5. **No CORS.** The Expo client calling from a device/emulator needs it (or a dev proxy).
@@ -321,7 +363,10 @@ Open work, roughly in dependency order:
    password reset flow, or session listing/revocation. Password change and refresh-token
    reuse detection are implemented. Access tokens are stateless, so logout/password change
    revokes refresh tokens but an already-issued access token remains valid until it expires.
-7. **`npm test` is a stub**, no CI, no lint/format config.
+7. **Test coverage is still foundational:** `npm test` runs Vitest smoke/unit tests (3
+   files, 14 tests), but there is no CI, lint/format config, coverage tooling, or database
+   integration suite. Database integration tests wait for a dedicated Neon test branch
+   before Phase 4.
 8. **`src/generated/` is gitignored** — fresh clones must run `npx prisma generate`, and
    `tsconfig` includes `src` so the build depends on generation having run.
 9. Deferred by design: appliance model/family tables, review audit records (who approved),
@@ -364,26 +409,28 @@ raw payloads. Store the access token in secure storage, send it as
 
 ### Persistent progress tracker
 
-- **Current phase:** Phase 1 — Schema & migration foundation (verdict + pending confirmation)
-- **Current phase status:** APPROVED BY USER (2026-11-16); migration applied and verified on the development Neon database
-- **Last implemented phase:** Phase 1
-- **Last phase with tests passed:** Phase 1 — migration applied successfully; post-apply DB verification, `prisma migrate status`, `prisma validate`, and `tsc --noEmit` passed; no automated test runner exists
-- **Last phase approved by user:** Phase 1 (2026-11-16)
-- **Next phase awaiting authorization:** Phase 2 — Environment, dependencies, and test harness foundation (NOT STARTED; separate authorization required)
-- **Outstanding decisions:** D1 resolved (safe `CALL_TECHNICIAN` → `TECHNICIAN_REQUIRED` rename, `UNRESOLVED` added; generated first and applied to development after separate authorization); D2 test stack/scripts; D3 default Groq model id; D4 explicit `FIXED` confirmation action form/contract; D5 `NEEDS_PART` completion trigger (end/ack and/or deterministic no-further-action rule); D6 initial parts provider enablement/keys; D7 streaming priority (JSON-only vs SSE in MVP); D8 CORS and/or basic rate limiting in-scope
-- **Last progress update:** 2026-11-16 — Phase 1 migration `20261116093023_verdict_pending_confirmation` applied and verified on development; Phase 1 explicitly approved by user. Standalone knowledge-base read-only audit completed and, after explicit user approval of the exact scope, 22 `ErrorCode` / 74 `USER_SAFE` `RepairStep` / 46 `ErrorCodeRepairStep` records were approved on the **development Neon DB only** (55 UNSPECIFIED ErrorCodes, 43 `TECHNICIAN_ONLY` steps, 142 links remain `UNREVIEWED`); verification passed (no non-`USER_SAFE` approved steps, no invalid approved links, only 1 complete production-returnable sequence, no partial sequence returnable). No production access, no schema/migration/seed/app-code changes, Phase 2 not started. Phase 2 remains NOT STARTED and requires separate authorization.
+- **Current phase:** Phase 2 — Environment, dependencies, and test harness foundation
+- **Current phase status:** APPROVED BY USER (2026-11-17)
+- **Last implemented phase:** Phase 2
+- **Last phase with tests passed:** Phase 2 — the user independently ran and verified `npm test` (14 tests passed across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate`; all passed on 2026-11-17. Production env guards were also verified during implementation.
+- **Last phase approved by user:** Phase 2 (2026-11-17)
+- **Next phase awaiting authorization:** Phase 3 — Diagnosis validators, middleware helpers, and route/controller scaffolding (NOT STARTED; separate authorization required)
+- **Outstanding decisions:** D1 resolved (safe `CALL_TECHNICIAN` → `TECHNICIAN_REQUIRED` rename, `UNRESOLVED` added); D2 resolved (Vitest 5 + Vite 8 + Supertest 7; `npm test` = `vitest run`); D3 resolved (default `openai/gpt-oss-120b`, env-configurable); D4 explicit `FIXED` confirmation action form/contract; D5 `NEEDS_PART` completion trigger (end/ack and/or deterministic no-further-action rule); D6 initial parts provider enablement/keys; D7 streaming priority (JSON-only vs SSE in MVP); D8 CORS and/or basic rate limiting in-scope; D9 resolved (no DB access in Phase 2; dedicated Neon test branch before Phase 4); D10 resolved (option C hybrid: approved error-code knowledge + symptom questioning/candidate narrowing for MVP, dedicated reviewed symptom/cause model later if needed)
+- **Last progress update:** 2026-11-17 — Phase 2 implemented and tested on 2026-11-16: added `groq-sdk` + Vitest/Vite/Supertest, pure env schema, required `NODE_ENV`, `GROQ_API_KEY` / `GROQ_MODEL` / `ALLOW_UNREVIEWED_KNOWLEDGE`, production guards, and a test harness. 14 tests in 3 files pass; typecheck, test-typecheck, build, and `prisma validate` pass. No database, network/AI call, seed, migration, or production access occurred; protected Swagger files remained byte-identical; package changes were additive. Phase 2 was explicitly approved by the user on 2026-11-17 after independently running and verifying `npm test` (14 tests across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate` (all passed). **Production knowledge promotion is still required:** the approved development Neon knowledge does not automatically exist in production, so a controlled promotion process is needed before launch. The audit found exactly **one** complete production-returnable sequence in the audited development dataset; this is a finding about that dataset only — production Neon was not inspected or updated.
 
-**Status values (use consistently):** `NOT STARTED` | `IN PROGRESS` | `IMPLEMENTED` | `TESTS PASSED` | `APPROVED BY USER`  
+**Status values (use consistently):** `NOT STARTED` | `IN PROGRESS` | `IMPLEMENTED` | `TESTS PASSED` | `APPROVAL PENDING` | `APPROVED BY USER`
 **Rule:** distinguish implementation completion, successful testing, and explicit user approval. Never mark `APPROVED BY USER` without the user's explicit approval.
 
 ### Current starting position (recorded)
 
 - Phases 1–9 are **planned and reviewed**; the implementation roadmap is **approved** as the plan.
-- **Phase 1 is APPROVED BY USER (2026-11-16).** Its migration is applied and verified on the development branch. No migration was applied to production, and no other implementation phase has been started.
-- **No seed was run during Phase 1. No production database was accessed.**
+- **Phase 1 is APPROVED BY USER (2026-11-16).** Its migration is applied and verified on the development branch. No migration was applied to production, and no implementation phase beyond Phase 2 has been started.
+- **Phase 2 is APPROVED BY USER (2026-11-17); implementation and tests completed 2026-11-16.** The user independently ran and verified `npm test` (14 tests passed across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate`; all passed. Phase 2 added only environment, dependency, and test-harness infrastructure; no database access, schema/migration/seed change, or diagnosis behavior. Phase 3 remains NOT STARTED.
+- **No seed was run during Phase 1 or Phase 2. No production database was accessed.**
+- **Phase 2 scope/decisions (implemented):** `groq-sdk` 1.6 + Vitest 5/Vite 8/Supertest 7; pure `env.schema.ts` + side-effecting `env.ts`; `NODE_ENV` required; only `GROQ_API_KEY`, `GROQ_MODEL`, and `ALLOW_UNREVIEWED_KNOWLEDGE` added; production rejects a missing Groq key and rejects unreviewed knowledge; `npm test` = `vitest run`; tests refuse `NODE_ENV=production` and use dummy credentials. Deferred: `GROQ_TIMEOUT_MS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_TOOL_ROUNDS`, `FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER`.
 - **Phase 1 scope/decisions (implemented):** `Verdict` is now `FIXED, NEEDS_PART, TECHNICIAN_REQUIRED, UNRESOLVED`; migration `20261116093023_verdict_pending_confirmation` safely renames `CALL_TECHNICIAN` → `TECHNICIAN_REQUIRED` and adds `UNRESOLVED`; `DiagnosisSession` gained the three approved nullable/server-managed fields `fixConfirmationChallengeId`, `fixConfirmationIssuedAt`, and `fixConfirmationExpiresAt` (single-use `FIXED` confirmation challenge persisted across requests; `Message` content is not authoritative). MVP keeps `applianceId`-based context (no ad-hoc snapshot columns).
 - **Preflight/apply state (development branch):** before apply, 3 migrations were applied; `Verdict` was `FIXED, NEEDS_PART, CALL_TECHNICIAN`; 0 `DiagnosisSession` rows; no `fixConfirmation*` columns. After explicit authorization, the migration was applied: the enum now has all four values, all three nullable columns exist, and `_prisma_migrations` records the migration as finished. Knowledge-base row counts were unchanged (15 sources, 77 error codes, 117 repair steps, 188 links) and diagnosis sessions remain 0.
-- **Baseline repo state at Phase 1 start:** diagnosis routes/controller/services are scaffolded/unwired (router not mounted in `app.ts`, controller empty, services empty); no `groq-sdk`, no test runner. Undocumented uncommitted Swagger/OpenAPI work exists and was preserved untouched.
+- **Baseline repo state at Phase 1 start:** diagnosis routes/controller/services are scaffolded/unwired (router not mounted in `app.ts`, controller empty, services empty); no `groq-sdk`, no test runner. Undocumented uncommitted Swagger/OpenAPI work exists and was preserved untouched. At Phase 2 start those dependencies and the test runner were still absent; Phase 2 added them.
 
 ### Permanent implementation workflow (follow in every future session)
 
@@ -425,13 +472,15 @@ raw payloads. Store the access token in secure storage, send it as
 | ID | Decision | Status | Notes |
 |---|---|---|---|
 | D1 | `Verdict` enum migration mapping/SQL strategy for `CALL_TECHNICIAN`→`TECHNICIAN_REQUIRED` and handling of any existing rows; generate-only vs apply in Phase 1 | **Resolved 2026-11-16** | In-place `ALTER TYPE ... RENAME VALUE` preserves existing values; `ADD VALUE 'UNRESOLVED'`. Generated and reviewed first, then applied to development via `migrate deploy` after separate explicit authorization. Preflight found 0 `DiagnosisSession` rows; post-apply verification passed. Production untouched. |
-| D2 | Test stack & scripts (`vitest`+`supertest` or alternative) | Open | Affects Phase 2+ and test evidence. |
-| D3 | Default Groq model id (tool-capable, env-configurable) | Open | Affects Phase 2/6 config & behavior. |
+| D2 | Test stack & scripts (`vitest`+`supertest` or alternative) | **Resolved 2026-11-16** | Vitest 5.1 + Vite 8.3.8 + Supertest 7.3.2; `npm test` = `vitest run`, with `test:watch` kept separate. Coverage/browser tooling deferred. |
+| D3 | Default Groq model id (tool-capable, env-configurable) | **Resolved 2026-11-16** | Default `openai/gpt-oss-120b`, overridable with `GROQ_MODEL`; no AI client code or API calls were implemented in Phase 2. |
 | D4 | Explicit `FIXED` confirmation action form/contract (e.g. dedicated endpoint/flag) matched to pending challenge | Open | Affects Phases 2–5/7 validators/routes/logic. |
 | D5 | `NEEDS_PART` completion trigger (explicit end/ack action and/or deterministic no-further-in-app-action rule) | Open | Affects Phases 3–4/7 transitions. |
 | D6 | Initial parts provider enablement (`none` default vs specific provider/API key) | Open | Affects Phase 8. |
 | D7 | Streaming priority (JSON-only MVP vs include SSE) | Open | Affects Phase 9 scope/timing. |
 | D8 | CORS and/or basic rate limiting in-scope | Open | Affects Phase 3/9 hardening. |
+| D9 | Test database strategy | **Resolved 2026-11-16** | No database access in Phase 2 (unit/HTTP smoke only). A dedicated Neon test branch must be created before Phase 4 database integration tests; the development branch is not used as a test database because it holds approved knowledge. |
+| D10 | Symptom-based diagnosis knowledge strategy | **Resolved 2026-11-16 — option C (hybrid)** | MVP uses approved error-code knowledge with symptom-based questioning and candidate narrowing. AI candidate codes are hypotheses, never confirmed diagnoses; the backend validates candidates against applicable knowledge before any repair instructions. A dedicated reviewed symptom/cause knowledge model may be added later if needed. |
 
 ### Complete approved implementation checklist (Phases 1–9)
 
@@ -512,7 +561,7 @@ raw payloads. Store the access token in secure storage, send it as
 | Phase | Status | Files changed | Schema/migration | Commands & results | Tests (pass/fail/not run) | Issues/deviations | Decisions needed | Explicit user approval |
 |---|---|---|---|---|---|---|---|---|
 | 1 | APPROVED BY USER (2026-11-16); migration applied and verified on development | `prisma/schema.prisma`; `prisma/migrations/20261116093023_verdict_pending_confirmation/migration.sql`; `CONTEXT.md`; `database_design/DATABASE_DESIGN.md`; regenerated gitignored `src/generated/prisma/**` | `Verdict` → FIXED/NEEDS_PART/TECHNICIAN_REQUIRED/UNRESOLVED; added nullable `fixConfirmationChallengeId`, `fixConfirmationIssuedAt`, `fixConfirmationExpiresAt`; migration generated, reviewed, then applied to the development branch | Preflight read-only DB; `prisma validate` pass; `prisma migrate diff` SQL reviewed; `prisma generate` pass; `tsc --noEmit` pass; `prisma migrate deploy` applied the pending migration; post-apply DB verification pass; `prisma migrate status` reports schema up to date; final `prisma validate` + `tsc --noEmit` pass | Migration executed successfully; post-apply enum/columns/migration-record checks passed; no automated test runner exists | `migrate dev --create-only` is non-interactive-unsupported; used read-only `migrate diff` + hand-created migration dir, then `migrate deploy`. No drift detected; no production access; no seed run. | D1 resolved | Yes — Phase 1 approved by user 2026-11-16 |
-| 2 | NOT STARTED | — | None | — | Not run | — | D2, D3 | No |
+| 2 | APPROVED BY USER (2026-11-17); implemented and tested 2026-11-16 | `src/config/env.schema.ts` (new); `src/config/env.ts`; `src/server.ts`; `.env.example`; `.gitignore`; `package.json`; `package-lock.json`; `vitest.config.ts` (new); `tsconfig.test.json` (new); `tests/setup-env.ts`, `tests/config/env.test.ts`, `tests/http/app.test.ts`, `tests/dependencies/groq-sdk.test.ts` (new); `CONTEXT.md` | None | `npm install groq-sdk@^1.6.0`; `npm install -D vitest@^5.1.0 vite@^8.3.8 supertest@^7.3.2 @types/supertest@^7.2.1`; `npm run typecheck` pass; `npm run typecheck:test` pass; `npm test` 14/14 pass; `npm run build` pass; `npx prisma validate` pass; production-guard commands exit 1 as expected; development env load exits 0; protected file hashes unchanged; lockfile has 0 missing pre-existing package keys | 3 files / 14 tests pass (independently re-run and verified by the user on 2026-11-17); no DB, network, or AI calls | No DB access; no schema/migration/seed/app/diagnosis/Swagger changes; `GROQ_TIMEOUT_MS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_TOOL_ROUNDS`, `FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER` deferred | D2, D3 resolved; D9, D10 resolved | Yes — Phase 2 approved by user 2026-11-17; user independently ran and verified `npm test` (14 tests / 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate` (all passed) |
 | 3 | NOT STARTED | — | None | — | Not run | — | D4, D5, D8 | No |
 | 4 | NOT STARTED | — | None | — | Not run | — | D4, D5 | No |
 | 5 | NOT STARTED | — | None | — | Not run | — | — | No |
@@ -570,3 +619,94 @@ ADD COLUMN     "fixConfirmationExpiresAt" TIMESTAMP(3);
 - No seed was run and no production database was accessed.
 
 **User approval:** Phase 1 was explicitly approved by the user on 2026-11-16, after review of the implementation, migration SQL, and development-database verification results.
+
+### Phase 2 implementation & approval record (implemented 2026-11-16; approved 2026-11-17)
+
+**Status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-17)**. Phase 3 was not
+started; nothing was staged or committed.
+
+**Authorized scope and corrections:** environment, dependencies, configuration, and test
+harness only. The user approved D2 (Vitest 5 + Vite 8 + Supertest 7), D3
+(`openai/gpt-oss-120b` default), a required `NODE_ENV`, no database access during Phase 2,
+a dedicated Neon test branch before Phase 4, `GROQ_API_KEY` optional in development/test
+and required in production, and no staging/commit. Phase 2 environment additions were kept
+minimal to `GROQ_API_KEY`, `GROQ_MODEL`, and `ALLOW_UNREVIEWED_KNOWLEDGE`;
+`GROQ_TIMEOUT_MS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_TOOL_ROUNDS`,
+`FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER` were deferred. D10 option C (hybrid)
+was chosen and recorded above.
+
+**Files created:**
+- `src/config/env.schema.ts`
+- `vitest.config.ts`
+- `tsconfig.test.json`
+- `tests/setup-env.ts`
+- `tests/config/env.test.ts`
+- `tests/http/app.test.ts`
+- `tests/dependencies/groq-sdk.test.ts`
+
+**Files modified:**
+- `package.json`, `package-lock.json` (additive dependency/script changes; Swagger entries preserved)
+- `src/config/env.ts`
+- `src/server.ts` (imports `env` before `app`)
+- `.env.example`
+- `.gitignore` (`.vitest/`)
+- `CONTEXT.md`
+
+**Not changed:** `src/app.ts`, `src/routes/auth.routes.ts`, `src/docs/**`, `prisma/**`,
+`prisma.config.ts`, `database_design/**`, `.env`, all diagnosis controllers/routes/services,
+and all database records.
+
+**Commands executed and results:**
+- `npm install groq-sdk@^1.6.0` — added 1 package, 0 vulnerabilities.
+- `npm install -D vitest@^5.1.0 vite@^8.3.8 supertest@^7.3.2 @types/supertest@^7.2.1` — added 59 packages, 0 vulnerabilities.
+- `npm run typecheck` — passed.
+- `npm run typecheck:test` — passed.
+- `npm test` (`vitest run`) — **14 tests passed in 3 files**.
+- `npm run build` — passed; `dist/` contains no test files.
+- `npx prisma validate` — schema valid.
+- Production guard check without `GROQ_API_KEY` — process exited `1` with
+  `GROQ_API_KEY: GROQ_API_KEY is required in production`.
+- Production guard check with `ALLOW_UNREVIEWED_KNOWLEDGE=true` — process exited `1` with
+  `ALLOW_UNREVIEWED_KNOWLEDGE: ALLOW_UNREVIEWED_KNOWLEDGE cannot be enabled in production`.
+- Development configuration load from the existing `.env` — exited `0`.
+
+**Independent user verification (2026-11-17):** the user independently ran and verified:
+- `npm test` — 14 tests passed across 3 files.
+- `npm run typecheck` — passed.
+- `npm run typecheck:test` — passed.
+- `npm run build` — passed.
+- `npx prisma validate` — passed.
+
+**Test coverage:** environment defaults, required `NODE_ENV`, `PORT` default/validation,
+`GROQ_MODEL` validation, production Groq-key requirement, empty-key handling, production
+rejection of unreviewed knowledge, boolean parsing, HTTP 404/400/401 envelopes, and Groq
+SDK ESM import/construction with a dummy key. The Groq test makes **no API request** and
+does not imply network connectivity was tested. `tests/setup-env.ts` checks the inherited
+`NODE_ENV` first, throws if it is `production`, and otherwise sets `NODE_ENV=test` plus
+dummy credentials before application modules are imported.
+
+**Protected work verification:** `src/app.ts`, `src/routes/auth.routes.ts`,
+`src/docs/openapi.ts`, and `src/docs/swagger.ts` remained byte-identical to the hashes
+recorded before implementation. `package.json` retains `swagger-ui-express` and
+`@types/swagger-ui-express`; the new lockfile retains those package entries, and a
+package-key comparison against the previous committed lockfile found **0** missing
+pre-existing package keys. The lockfile also contains npm re-resolution changes; no
+pre-existing dependency was removed.
+
+**Issues/deviations:** none beyond the npm lockfile re-resolution noted above. No database
+connection, network request, Groq API call, seed run, migration, or production access
+occurred. Swagger/OpenAPI files were preserved untouched.
+
+**Production knowledge-promotion requirement (recorded):** the approved knowledge updates
+were applied to the **development** Neon database only. They do **not** automatically exist
+in production. A controlled promotion process is required before launch, with verification
+that the same approved records, review statuses, model scopes, safety classifications, and
+complete sequences exist in production.
+
+**Audit scope note (recorded):** the earlier audit identified exactly **one** complete
+production-returnable sequence in the audited development dataset (LG `WASHING_MACHINE`
+`FE`, `TOP_LOAD`, `01a1d97f-b545-736b-a307-5d55dbf9c829`). This is a finding about the
+development dataset only. **Production Neon was not inspected or updated.**
+
+**User approval:** Yes — Phase 2 was explicitly approved by the user on 2026-11-17 after
+independently running and verifying the commands listed above.

@@ -1,3 +1,5 @@
+
+// This files contains the routes for authentication related endpoints
 import { Router } from 'express';
 import {
   changePassword,
@@ -12,7 +14,7 @@ import { validateBody } from '../middleware/validate.js';
 import {
   changePasswordSchema,
   loginSchema,
-  refreshTokenSchema,
+  refreshTokenSchema, 
   registerSchema,
 } from '../validators/auth.validator.js';
 
