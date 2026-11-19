@@ -1,0 +1,271 @@
+import { describe, expect, it } from 'vitest';
+import { openApiSpec } from '../../src/docs/openapi.js';
+import {
+  messageDtoSelect,
+  sessionDtoSelect,
+  toMessageDto,
+  toPaginatedDto,
+  toSessionDto,
+} from '../../src/types/diagnosis.dto.js';
+import {
+  completeSessionSchema,
+  confirmFixSchema,
+  createSessionSchema,
+  listMessagesQuerySchema,
+  listSessionsQuerySchema,
+  sendMessageSchema,
+} from '../../src/validators/diagnosis.validator.js';
+
+// The contract test reads the spec as JSON-like data so a missing nested key
+// fails as an assertion instead of a TypeScript error.
+type AnyRecord = Record<string, any>;
+const spec = openApiSpec as unknown as AnyRecord;
+
+function schema(name: string): AnyRecord {
+  return spec.components.schemas[name];
+}
+
+function response(name: string): AnyRecord {
+  return spec.components.responses[name];
+}
+
+function operation(path: string, method: string): AnyRecord {
+  return spec.paths[path]?.[method];
+}
+
+function responseText(op: AnyRecord, status: string): string {
+  const entry = op.responses?.[status] ?? {};
+  const ref = entry.$ref as string | undefined;
+  const name = ref?.match(/^#\/components\/responses\/(.+)$/)?.[1];
+  return JSON.stringify(name ? response(name) : entry);
+}
+
+const DIAGNOSIS_PATHS = {
+  '/diagnosis': ['post', 'get'],
+  '/diagnosis/{id}': ['get'],
+  '/diagnosis/{id}/messages': ['get', 'post'],
+  '/diagnosis/{id}/confirm': ['post'],
+  '/diagnosis/{id}/complete': ['post'],
+} as const;
+
+describe('OpenAPI document shape', () => {
+  it('is a valid OpenAPI 3 document with a JWT bearer scheme', () => {
+    expect(spec.openapi).toBe('3.0.3');
+    expect(spec.info.title).toBe('FixIt API');
+    expect(spec.components.securitySchemes.bearerAuth).toMatchObject({
+      type: 'http',
+      scheme: 'bearer',
+      bearerFormat: 'JWT',
+    });
+  });
+
+  it('documents exactly the seven live diagnosis operations', () => {
+    expect(Object.keys(spec.paths).filter((path) => path.startsWith('/diagnosis'))).toEqual(
+      Object.keys(DIAGNOSIS_PATHS),
+    );
+
+    for (const [path, methods] of Object.entries(DIAGNOSIS_PATHS)) {
+      expect(Object.keys(spec.paths[path]).sort()).toEqual([...methods].sort());
+    }
+  });
+
+  it.each(Object.entries(DIAGNOSIS_PATHS).flatMap(([path, methods]) =>
+    methods.map((method) => [path, method] as const),
+  ))('requires bearer authorization for %s %s', (path, method) => {
+    expect(operation(path, method).security).toEqual([{ bearerAuth: [] }]);
+  });
+
+  it('no longer describes diagnosis as an unmounted draft', () => {
+    expect(JSON.stringify(spec)).not.toMatch(/NOT MOUNTED/i);
+    expect(JSON.stringify(spec.info.description)).toMatch(/conversations/);
+  });
+});
+
+describe('request schemas match the validators', () => {
+  it('documents the create-session body and its model-number-free contract', () => {
+    const body = operation('/diagnosis', 'post').requestBody;
+    expect(body.required).toBe(true);
+    expect(body.content['application/json'].schema.$ref).toBe('#/components/schemas/CreateDiagnosisRequest');
+
+    const create = schema('CreateDiagnosisRequest');
+    expect(create.required).toEqual(['applianceId']);
+    expect(create.properties.applianceId.format).toBe('uuid');
+    expect(create.properties.symptom.maxLength).toBe(2000);
+    expect(create.properties.errorCode.maxLength).toBe(64);
+    expect(create.anyOf).toEqual([{ required: ['symptom'] }, { required: ['errorCode'] }]);
+    expect(create.description).toMatch(/model number is NOT required/i);
+
+    // The validator itself still enforces the same optional clue contract.
+    expect(createSessionSchema.safeParse({ applianceId: 'not-a-uuid', symptom: 'x' }).success).toBe(false);
+    expect(createSessionSchema.safeParse({ applianceId: crypto.randomUUID() }).success).toBe(false);
+    expect(createSessionSchema.safeParse({ applianceId: crypto.randomUUID(), errorCode: 'FE' }).success).toBe(true);
+  });
+
+  it('documents message, confirmation and completion bodies', () => {
+    const send = schema('SendMessageRequest');
+    expect(send.required).toEqual(['content']);
+    expect(send.properties.content.maxLength).toBe(4000);
+    expect(sendMessageSchema.safeParse({ content: '   ' }).success).toBe(false);
+
+    const confirm = schema('ConfirmFixRequest');
+    expect(confirm.required).toEqual(['challengeId']);
+    expect(confirm.properties.challengeId.maxLength).toBe(200);
+    expect(confirmFixSchema.safeParse({ challengeId: '' }).success).toBe(false);
+
+    const complete = schema('CompleteSessionRequest');
+    expect(complete.properties.acknowledged.enum).toEqual([true]);
+    expect(completeSessionSchema.safeParse({ acknowledged: false }).success).toBe(false);
+  });
+
+  it('documents pagination defaults and bounds from the query validators', () => {
+    const sessionListParams = operation('/diagnosis', 'get').parameters.map((p: AnyRecord) => p.$ref);
+    expect(sessionListParams).toEqual([
+      '#/components/parameters/PageParam',
+      '#/components/parameters/LimitParam',
+    ]);
+
+    const messageListParams = operation('/diagnosis/{id}/messages', 'get').parameters.map(
+      (p: AnyRecord) => p.$ref,
+    );
+    expect(messageListParams).toEqual([
+      '#/components/parameters/SessionIdParam',
+      '#/components/parameters/PageParam',
+      '#/components/parameters/LimitParam',
+    ]);
+
+    const page = spec.components.parameters.PageParam.schema;
+    const limit = spec.components.parameters.LimitParam.schema;
+    expect(page).toMatchObject({ type: 'integer', minimum: 1, default: 1 });
+    expect(limit).toMatchObject({ type: 'integer', minimum: 1, maximum: 100, default: 20 });
+    expect(listSessionsQuerySchema.parse({})).toEqual({ page: 1, limit: 20 });
+    expect(listMessagesQuerySchema.parse({ page: '2', limit: '100' })).toEqual({ page: 2, limit: 100 });
+  });
+});
+
+describe('response schemas match the DTO mappers', () => {
+  const rawSession = {
+    id: '00000000-0000-7000-8000-000000000002',
+    applianceId: '00000000-0000-7000-8000-000000000001',
+    symptom: 'Not draining',
+    status: 'OPEN' as const,
+    verdict: null,
+    createdAt: new Date('2026-11-17T00:00:00.000Z'),
+    updatedAt: new Date('2026-11-17T00:00:00.000Z'),
+    userId: 'secret-user-id',
+    errorCodeId: null,
+    fixConfirmationChallengeId: null,
+    fixConfirmationIssuedAt: null,
+    fixConfirmationExpiresAt: null,
+  };
+
+  const rawMessage = {
+    id: '00000000-0000-7000-8000-000000000003',
+    sessionId: rawSession.id,
+    role: 'USER' as const,
+    content: 'I cleaned the filter',
+    createdAt: new Date('2026-11-17T00:01:00.000Z'),
+  };
+
+  it('documents exactly the session fields the mapper returns', () => {
+    const mapped = toSessionDto(rawSession);
+    expect(Object.keys(sessionDtoSelect).sort()).toEqual(Object.keys(mapped).sort());
+    expect(Object.keys(schema('SessionDto').properties).sort()).toEqual(Object.keys(mapped).sort());
+    expect(schema('SessionDto').required.sort()).toEqual(Object.keys(mapped).sort());
+    expect(schema('SessionDto').additionalProperties).toBe(false);
+
+    const serialized = JSON.stringify(mapped);
+    for (const hidden of ['userId', 'errorCodeId', 'fixConfirmation']) {
+      expect(serialized).not.toContain(hidden);
+    }
+  });
+
+  it('documents exactly the message fields the mapper returns', () => {
+    const mapped = toMessageDto(rawMessage);
+    expect(Object.keys(messageDtoSelect).sort()).toEqual(Object.keys(mapped).sort());
+    expect(Object.keys(schema('MessageDto').properties).sort()).toEqual(Object.keys(mapped).sort());
+    expect(schema('MessageDto').required.sort()).toEqual(Object.keys(mapped).sort());
+    expect(schema('MessageDto').additionalProperties).toBe(false);
+  });
+
+  it('documents the shared pagination envelope', () => {
+    const page = toPaginatedDto([toMessageDto(rawMessage)], 3, 2, 1);
+    const keys = Object.keys(page).sort();
+    for (const name of ['PaginatedSessionDto', 'PaginatedMessageDto']) {
+      expect(Object.keys(schema(name).properties).sort()).toEqual(keys);
+      expect(schema(name).required.sort()).toEqual(keys);
+    }
+    expect(page).toEqual({
+      items: [toMessageDto(rawMessage)],
+      page: 2,
+      limit: 1,
+      total: 3,
+      totalPages: 3,
+    });
+    expect(toPaginatedDto([], 0, 1, 20).totalPages).toBe(0);
+  });
+});
+
+describe('status codes and error responses match service behaviour', () => {
+  it('documents success, validation and auth codes on implemented operations', () => {
+    const expected: Record<string, Record<string, string[]>> = {
+      '/diagnosis': {
+        post: ['201', '400', '401', '404', '500'],
+        get: ['200', '400', '401', '500'],
+      },
+      '/diagnosis/{id}': { get: ['200', '400', '401', '404', '500'] },
+      '/diagnosis/{id}/messages': {
+        get: ['200', '400', '401', '404', '500'],
+        post: ['201', '400', '401', '404', '409', '500'],
+      },
+    };
+
+    for (const [path, methods] of Object.entries(expected)) {
+      for (const [method, statuses] of Object.entries(methods)) {
+        expect(Object.keys(operation(path, method).responses).sort()).toEqual([...statuses].sort());
+      }
+    }
+  });
+
+  it('uses named error responses with the exact service error codes', () => {
+    expect(response('ApplianceNotFound')).toBeDefined();
+    expect(response('SessionNotFound')).toBeDefined();
+    expect(response('SessionClosed')).toBeDefined();
+    expect(response('NotImplemented')).toBeDefined();
+    expect(responseText(operation('/diagnosis', 'post'), '404')).toContain('APPLIANCE_NOT_FOUND');
+    expect(responseText(operation('/diagnosis/{id}', 'get'), '404')).toContain('SESSION_NOT_FOUND');
+    expect(responseText(operation('/diagnosis/{id}/messages', 'get'), '404')).toContain('SESSION_NOT_FOUND');
+    expect(responseText(operation('/diagnosis/{id}/messages', 'post'), '409')).toContain('SESSION_CLOSED');
+  });
+
+  it('keeps confirm and complete documented as 501 placeholders with valid bodies', () => {
+    for (const path of ['/diagnosis/{id}/confirm', '/diagnosis/{id}/complete']) {
+      const op = operation(path, 'post');
+      expect(Object.keys(op.responses).sort()).toEqual(['400', '401', '501']);
+      expect(responseText(op, '501')).toContain('NOT_IMPLEMENTED');
+      expect(op.requestBody.required).toBe(true);
+      expect(op.parameters).toEqual([{ $ref: '#/components/parameters/SessionIdParam' }]);
+    }
+  });
+
+  it('keeps every $ref resolvable for Swagger UI Try it out', () => {
+    const refs: string[] = [];
+    const collect = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        value.forEach(collect);
+      } else if (value && typeof value === 'object') {
+        for (const [key, nested] of Object.entries(value)) {
+          if (key === '$ref' && typeof nested === 'string') refs.push(nested);
+          else collect(nested);
+        }
+      }
+    };
+    collect(spec);
+
+    expect(refs.length).toBeGreaterThan(0);
+    for (const ref of refs) {
+      const [, group, name] = ref.match(/^#\/components\/(\w+)\/(.+)$/) ?? [];
+      expect(group).toBeDefined();
+      expect(spec.components[group]?.[name]).toBeDefined();
+    }
+  });
+});

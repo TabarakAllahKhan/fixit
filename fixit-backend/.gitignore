@@ -1,3 +1,5 @@
 .env
 .vitest/
 src/generated/
+.env.test
+!.env.test.example

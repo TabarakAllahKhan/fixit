@@ -26,7 +26,7 @@ out and not yet wired in.
 | Auth           | `bcryptjs` password hashes, `jsonwebtoken` access tokens, opaque hashed refresh tokens |
 | AI provider    | `groq-sdk` 1.6 installed; adapter/tool loop not implemented and no calls made yet |
 | Dev runner     | `tsx watch`                                                         |
-| Tests          | Vitest 5 + Vite 8 + Supertest 7 (`npm test` = `vitest run`)          |
+| Tests          | Vitest 5 + Vite 8 + Supertest 7 (`npm test` = DB-free `vitest run`; `npm run test:db` = isolated DB suite) |
 | Lint / format  | **None configured**                                                 |
 
 Pinned: `prisma`, `@prisma/client`, `@prisma/adapter-pg` all at **7.10.1** — keep them in
@@ -37,16 +37,25 @@ without rewriting the schema.
 
 ```
 fixit-backend/
-├─ .env                  # secrets, gitignored
-├─ .env.example          # documents every required variable
+├─ .env                  # secrets, gitignored (development project)
+├─ .env.test             # isolated test-project credentials, gitignored (never print)
+├─ .env.example          # documents every required application variable
+├─ .env.test.example     # committed placeholders for TEST_* vars only (RUN_DB_TESTS=0)
 ├─ prisma.config.ts      # Prisma CLI config (schema path, migrations, DIRECT_URL)
-├─ vitest.config.ts      # Vitest config: node env, tests/**/*.test.ts, envDir false
-├─ tsconfig.test.json    # typecheck src + tests + vitest.config.ts (noEmit)
+├─ vitest.config.ts      # DB-free runner: tests/**/*.test.ts excluding tests/db, envDir false
+├─ vitest.db.config.ts   # DB runner: tests/db/**/*.test.ts, envDir false, serial
+├─ tsconfig.test.json    # typecheck src + tests + both vitest configs (noEmit)
 ├─ tests/
 │  ├─ setup-env.ts       # refuses NODE_ENV=production; sets dummy env before imports
 │  ├─ config/env.test.ts # env schema + production guard tests
 │  ├─ http/app.test.ts   # Supertest smoke tests (no database)
-│  └─ dependencies/groq-sdk.test.ts # ESM import/construction only, no network
+│  ├─ http/diagnosis.routes.test.ts # auth/validation/501/CORS scaffolding tests (no database)
+│  ├─ dependencies/groq-sdk.test.ts # ESM import/construction only, no network
+│  └─ db/                # Phase 4A: isolated fixit-test runner only
+│     ├─ setup-db-env.ts # fail-closed allowlist/opt-in guard; sets pooled test URL
+│     ├─ helpers.ts      # user/appliance fixtures, cleanup, DTO assertion helpers
+│     ├─ guards.test.ts  # negative guard cases, fail before any connection
+│     └─ smoke.test.ts   # read-only connectivity/schema/sentinel checks
 ├─ prisma/
 │  ├─ schema.prisma      # 9 models, 8 enums
 │  └─ migrations/
@@ -68,7 +77,7 @@ fixit-backend/
    ├─ routes/
    │  ├─ health.routes.ts        # GET /
    │  ├─ auth.routes.ts          # register/login/refresh/logout/change-password, GET me
-   │  └─ diagnosis.routes.ts     # POST /  (not mounted yet)
+   │  └─ diagnosis.routes.ts     # 7 authenticated routes; Phase 3 stubs return 501
    ├─ controllers/
    │  ├─ auth.controller.ts      # auth HTTP handlers
    │  └─ diagnosis.controller.ts # STUB
@@ -83,11 +92,13 @@ fixit-backend/
    │  └─ appliance-scan.service.ts # placeholder
    ├─ middleware/
    │  ├─ auth.middleware.ts      # requireAuth -> attaches req.user
-   │  ├─ validate.ts             # Zod request-body validation
+   │  ├─ validate.ts             # Zod body/params/query validation (req.validatedQuery)
+   │  ├─ cors.ts                 # minimal Origin reflection + preflight (Phase 3)
    │  ├─ errorHandler.ts         # 4-arg Express error handler, last middleware
    │  └─ notFound.ts             # 404 catch-all
    ├─ validators/
-   │  └─ auth.validator.ts       # register/login/refresh/change-password schemas
+   │  ├─ auth.validator.ts       # register/login/refresh/change-password schemas
+   │  └─ diagnosis.validator.ts  # session/message/confirm/complete schemas (Phase 3)
    ├─ types/
    │  └─ express.d.ts            # req.user declaration for requireAuth
    ├─ utils/
@@ -98,21 +109,24 @@ fixit-backend/
    └─ generated/prisma/          # Prisma client output, GITIGNORED
 ```
 
-`src/app.ts` mounts `/health` and `/auth`; it still does **not** import
-`routes/diagnosis.routes.ts`, so diagnosis is not live. The working tree also mounts an
-uncommitted Swagger `/docs` router (`src/docs/**`); that pre-existing work is preserved
-untouched and is not part of Phase 2. `postinstall`/generate is not scripted; run
-`prisma generate` after a fresh clone (see §7).
+`src/app.ts` mounts `/health`, `/auth`, `/diagnosis` and the pre-existing Swagger `/docs`
+router, with minimal CORS middleware ahead of the routers. Diagnosis is reachable but every
+route currently resolves to a `501 NOT_IMPLEMENTED` stub. The Swagger work described in
+earlier notes as uncommitted was already committed at the start of Phase 3 (single commit
+`15ccfeb`); it was preserved byte-identical and is not part of Phase 3. `postinstall`/generate
+is not scripted; run `prisma generate` after a fresh clone (see §7).
 
 ## 4. Request lifecycle
 
 `server.ts` → `app.ts`:
-1. `express.json()` body parser
-2. `app.use("/health", healthRouter)`
-3. `app.use("/auth", authRouter)`
-4. `app.use("/docs", docsRouter)` — uncommitted Swagger UI/OpenAPI JSON work, working tree only
-5. `notFound` → `{ success:false, error:{ code:"NOT_FOUND", message:"Route not found" } }`, 404
-6. `errorHandler` → expected failures thrown as `HttpError` keep their status/code;
+1. `corsMiddleware` — reflects `Origin`, sets allow-methods/headers, short-circuits `OPTIONS` with 204
+2. `express.json()` body parser
+3. `app.use("/health", healthRouter)`
+4. `app.use("/auth", authRouter)`
+5. `app.use("/diagnosis", diagnosisRouter)` — `requireAuth` then per-route Zod validation
+6. `app.use("/docs", docsRouter)` — Swagger UI/OpenAPI JSON, preserved untouched by Phase 3
+7. `notFound` → `{ success:false, error:{ code:"NOT_FOUND", message:"Route not found" } }`, 404
+8. `errorHandler` → expected failures thrown as `HttpError` keep their status/code;
    unknown errors log their stack server-side and return `INTERNAL_ERROR` / 500. Never leaks
    internals. If headers were already sent it delegates back to Express.
 
@@ -129,7 +143,7 @@ Existing codes: `VALIDATION_ERROR` (400), `PASSWORD_UNCHANGED` (400), `UNAUTHORI
 (401), `INVALID_CREDENTIALS` (401), `INVALID_REFRESH_TOKEN` (401),
 `REFRESH_TOKEN_REUSED` (401), `NOT_FOUND` (404), `EMAIL_ALREADY_EXISTS` /
 `USERNAME_ALREADY_EXISTS` / `ACCOUNT_ALREADY_EXISTS` (409), `INTERNAL_ERROR` (500),
-`DATABASE_UNAVAILABLE` (503).
+`DATABASE_UNAVAILABLE` (503), `NOT_IMPLEMENTED` (501, Phase 3 scaffold stubs).
 Add new codes as SCREAMING_SNAKE_CASE; never put raw error text in `message`.
 
 ### Endpoints
@@ -143,7 +157,14 @@ Add new codes as SCREAMING_SNAKE_CASE; never put raw error text in `message`.
 | POST   | `/auth/logout`    | Working     | Body `{ refreshToken }` → 200 `{ message }`; revokes the token, idempotent |
 | POST   | `/auth/change-password` | Working | Requires `Authorization: Bearer <accessToken>`; body `{ currentPassword, newPassword }` → 200 `{ message }`; wrong current password → 401, unchanged/short new password → 400; revokes all active refresh tokens |
 | GET    | `/auth/me`        | Working     | Requires `Authorization: Bearer <accessToken>` → 200 `{ user }`; missing/invalid token → 401 |
-| POST   | `/diagnosis` (assumed base path) | Not mounted | Router exists but is never registered; controller is an empty `try/catch` that never responds |
+| POST   | `/diagnosis` | Working (Phase 4B) | Auth + validated body (`applianceId` required; at least one of `symptom`/`errorCode`) → 201 `SessionDto`; verifies appliance ownership in a transaction and writes the initial USER message; 404 `APPLIANCE_NOT_FOUND` |
+| GET    | `/diagnosis` | Working (Phase 4B) | Auth + paginated query (`page=1`, `limit=20`, max 100) → 200 paginated `SessionDto` list, owned only, `createdAt DESC, id DESC` |
+| GET    | `/diagnosis/:id` | Working (Phase 4B) | Auth + UUID param validation → 200 `SessionDto` for an owned session; otherwise 404 `SESSION_NOT_FOUND` |
+| GET    | `/diagnosis/:id/messages` | Working (Phase 4B) | Auth + UUID param + paginated query → 200 paginated `MessageDto` list, `createdAt ASC, id ASC` |
+| POST   | `/diagnosis/:id/messages` | Working (Phase 4B) | Auth + UUID param + `{ content }` → 201 `MessageDto`; only for owned OPEN sessions, otherwise 404/409 `SESSION_CLOSED` |
+| POST   | `/diagnosis/:id/confirm` | Stub (Phase 4B) | Auth + UUID param + `{ challengeId }` → `501 NOT_IMPLEMENTED`; client never supplies a verdict |
+| POST   | `/diagnosis/:id/complete` | Stub (Phase 4B) | Auth + UUID param + `{ acknowledged: true }` → `501 NOT_IMPLEMENTED` |
+| OPTIONS| any path | Working (Phase 3) | Minimal CORS preflight → `204` with allow-origin/methods/headers |
 
 Auth contract: register/login return
 `{ user, tokens: { accessToken, refreshToken, tokenType: "Bearer", expiresIn } }`.
@@ -220,6 +241,18 @@ Enums: `ApplianceCategory` (WASHING_MACHINE, REFRIGERATOR), `SourceKind`, `Revie
 | `GROQ_MODEL`   | `src/config/env.schema.ts`; future AI service | tool-capable model id; default `openai/gpt-oss-120b`, non-empty override allowed |
 | `ALLOW_UNREVIEWED_KNOWLEDGE` | `src/config/env.schema.ts`; future knowledge service | development-only switch; default `false`; accepts exactly `true`/`false`; **startup failure when `NODE_ENV=production`** |
 
+### Test-only environment (Phase 4A)
+
+`fixit-test` is a completely separate Neon project. Its credentials exist only in the
+gitignored `.env.test`; the committed `.env.test.example` contains placeholders only,
+including `RUN_DB_TESTS=0`. No `TEST_*` variable is present in `.env.example`.
+
+| Var | Used by | Notes |
+| --- | --- | --- |
+| `TEST_DATABASE_URL` | `tests/db/setup-db-env.ts` → `DATABASE_URL` | pooled `fixit-test` connection; host must be exactly the allowlisted pooler host |
+| `TEST_DIRECT_URL` | guard in `tests/db/setup-db-env.ts`; one-time `prisma migrate deploy` | direct `fixit-test` connection; host must be exactly the allowlisted direct host |
+| `RUN_DB_TESTS` | DB runner and provisioning | must be exactly `1`; a value of `1` must never be committed |
+
 Configuration is split so the rules are testable: `env.schema.ts` is a pure Zod schema plus
 `parseEnv(raw)` with no dotenv, logging, or process exit; `env.ts` loads dotenv, validates
 `process.env`, prints only variable names/messages (never values), and exits `1` on failure.
@@ -234,8 +267,13 @@ read only by the seed and is not part of that schema. `prisma.ts` reads
 sync if you add config. The JWT secret has no default, so a fresh clone must copy
 `.env.example` and generate a real value before `npm run dev`.
 
-The Neon project has separate production and development branches. The local backend
-`.env` points both `DIRECT_URL` and `DATABASE_URL` at the development branch.
+Databases are separated by Neon **project**, not by branch. `fixit-development-preserved`
+is the primary development project (current direct host
+`ep-winter-credit-ao2gv7ym.c-2.ap-southeast-1.aws.neon.tech`; the older
+`ep-shy-glade-a1uvm947` host belonged to the original development project and is not the
+current one). `fixit-test` is a separate, isolated project used only by the DB test runner;
+production is a different project that test tooling never contacts. The local backend `.env`
+points both `DIRECT_URL` and `DATABASE_URL` at the development project.
 `src/scripts/seed.ts` requires `SEED_TARGET=development`, validates both URLs against the
 approved development hostname, and rejects `NODE_ENV=production` unconditionally. It never
 prints connection strings or secrets.
@@ -250,7 +288,8 @@ npm run build            # tsc -> dist/ (tests are excluded)
 npm start                # node dist/server.js (requires build first)
 npm run typecheck        # tsc --noEmit  (currently passes clean)
 npm run typecheck:test   # typecheck src + tests + vitest.config.ts
-npm test                 # vitest run (one-shot, CI-style)
+npm test                 # vitest run (one-shot, CI-style; excludes tests/db, no DB access)
+npm run test:db          # vitest run --config vitest.db.config.ts (isolated fixit-test only)
 npm run test:watch       # vitest watch mode
 npm run db:seed          # tsx src/scripts/seed.ts (requires SEED_TARGET=development; uses DIRECT_URL)
 
@@ -261,9 +300,16 @@ npx prisma studio                          # browse data
 npx tsx src/scripts/test-prisma.ts         # one-off connection smoke test
 ```
 
-Tests currently cover the environment schema/guards, HTTP routing/envelope smoke checks, and
-Groq SDK ESM import/construction. They use dummy credentials, make no database connection,
-and make no network/AI calls. `tests/setup-env.ts` refuses to run when `NODE_ENV=production`.
+Tests currently cover the environment schema/guards, HTTP routing/envelope smoke checks,
+diagnosis auth-before-validation, validation, pagination bounds, remaining `501` stubs,
+404 and minimal CORS, OpenAPI contract drift, and Groq SDK ESM import/construction:
+56 tests in 5 files via `npm test`. They use dummy credentials, make no database connection,
+and make no network/AI calls. The separate `npm run test:db` runner adds 27 tests in 3 files
+against `fixit-test` only: 9 pure fail-closed guard cases, 6 read-only schema/smoke checks,
+and 12 diagnosis integration cases (creation, ownership, optional model number, rollback,
+pagination, ordering, closed-session rejection and conditional concurrent close).
+`tests/setup-env.ts` refuses to run when `NODE_ENV=production`; `tests/db/setup-db-env.ts`
+additionally requires `RUN_DB_TESTS=1` and an exact test-host allowlist match.
 
 ## 8. Conventions observed in the code
 
@@ -347,26 +393,30 @@ Knowledge-base read-only audit and scoped approval (2026-11-16, development Neon
 
 Open work, roughly in dependency order:
 
-1. **`POST /diagnosis` never responds.** `diagnosis.controller.ts` has an empty `try`
-   block: no service call, no `sendSuccess`, no `next`. Any request would hang until
-   timeout. Don't mount the router until this is implemented.
-2. **Diagnosis router not mounted.** `app.ts` imports `healthRouter` and `authRouter`, but
-   still not `diagnosisRouter`.
-3. **All five diagnosis/knowledge services are empty placeholders** — `knowledge`
-   (retrieval + review rules), `diagnosis` (orchestration), `ai` (LLM call), `session`
-   (persistence), `appliance-scan` (image → appliance/error code). `groq-sdk` is installed
-   and import-verified, but no AI client code, tool loop, or API call exists yet.
-4. **Validation middleware exists for auth only.** Reuse `validateBody` and create
-   schema-per-route validators before writing the diagnosis controller.
-5. **No CORS.** The Expo client calling from a device/emulator needs it (or a dev proxy).
+1. **Five diagnosis APIs persist conversations (Phase 4B).** Session/message creation,
+   listing, retrieval and message sending are wired to Prisma with owner-scoped queries,
+   DTO mappers, transactions and bounded pagination. Confirm/complete remain 501 stubs.
+2. **Diagnosis router is mounted in `app.ts`** (Phase 3); no further wiring was needed for
+   Phase 4B.
+3. **Session/message services are implemented; other services remain empty placeholders** —
+   `knowledge` (retrieval + review rules), `ai` (LLM call), `appliance-scan`
+   (image → appliance/error code). `groq-sdk` is installed and import-verified, but no AI
+   client code, tool loop, or API call exists yet. Phase 4B stores and retrieves text only;
+   it does not understand appliance problems or generate replies.
+4. **Validation middleware now covers bodies, params and query.** `validateBody`,
+   `validateParams` and `validateQuery` exist, with diagnosis schemas in
+   `src/validators/diagnosis.validator.ts`; parsed query lives at `req.validatedQuery`.
+5. **Minimal CORS is in place (Phase 3).** It reflects the request `Origin` and answers
+   preflights; a strict allowlist and rate limiting were deferred (rate limiting to Phase 9).
 6. **Auth hardening still deferred:** no rate limiting/account lockout, email verification,
    password reset flow, or session listing/revocation. Password change and refresh-token
    reuse detection are implemented. Access tokens are stateless, so logout/password change
    revokes refresh tokens but an already-issued access token remains valid until it expires.
-7. **Test coverage is still foundational:** `npm test` runs Vitest smoke/unit tests (3
-   files, 14 tests), but there is no CI, lint/format config, coverage tooling, or database
-   integration suite. Database integration tests wait for a dedicated Neon test branch
-   before Phase 4.
+7. **Test coverage now includes feature integration:** `npm test` runs Vitest unit/HTTP/docs
+   tests (5 files, 56 tests), still completely DB-free. `npm run test:db` runs 27 tests in
+   3 files against the isolated `fixit-test` project: Phase 4A fail-closed guards and smoke
+   checks plus Phase 4B feature integration. There is still no CI, lint/format config, or
+   coverage tooling.
 8. **`src/generated/` is gitignored** — fresh clones must run `npx prisma generate`, and
    `tsconfig` includes `src` so the build depends on generation having run.
 9. Deferred by design: appliance model/family tables, review audit records (who approved),
@@ -409,14 +459,14 @@ raw payloads. Store the access token in secure storage, send it as
 
 ### Persistent progress tracker
 
-- **Current phase:** Phase 2 — Environment, dependencies, and test harness foundation
-- **Current phase status:** APPROVED BY USER (2026-11-17)
-- **Last implemented phase:** Phase 2
-- **Last phase with tests passed:** Phase 2 — the user independently ran and verified `npm test` (14 tests passed across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate`; all passed on 2026-11-17. Production env guards were also verified during implementation.
-- **Last phase approved by user:** Phase 2 (2026-11-17)
-- **Next phase awaiting authorization:** Phase 3 — Diagnosis validators, middleware helpers, and route/controller scaffolding (NOT STARTED; separate authorization required)
-- **Outstanding decisions:** D1 resolved (safe `CALL_TECHNICIAN` → `TECHNICIAN_REQUIRED` rename, `UNRESOLVED` added); D2 resolved (Vitest 5 + Vite 8 + Supertest 7; `npm test` = `vitest run`); D3 resolved (default `openai/gpt-oss-120b`, env-configurable); D4 explicit `FIXED` confirmation action form/contract; D5 `NEEDS_PART` completion trigger (end/ack and/or deterministic no-further-action rule); D6 initial parts provider enablement/keys; D7 streaming priority (JSON-only vs SSE in MVP); D8 CORS and/or basic rate limiting in-scope; D9 resolved (no DB access in Phase 2; dedicated Neon test branch before Phase 4); D10 resolved (option C hybrid: approved error-code knowledge + symptom questioning/candidate narrowing for MVP, dedicated reviewed symptom/cause model later if needed)
-- **Last progress update:** 2026-11-17 — Phase 2 implemented and tested on 2026-11-16: added `groq-sdk` + Vitest/Vite/Supertest, pure env schema, required `NODE_ENV`, `GROQ_API_KEY` / `GROQ_MODEL` / `ALLOW_UNREVIEWED_KNOWLEDGE`, production guards, and a test harness. 14 tests in 3 files pass; typecheck, test-typecheck, build, and `prisma validate` pass. No database, network/AI call, seed, migration, or production access occurred; protected Swagger files remained byte-identical; package changes were additive. Phase 2 was explicitly approved by the user on 2026-11-17 after independently running and verifying `npm test` (14 tests across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate` (all passed). **Production knowledge promotion is still required:** the approved development Neon knowledge does not automatically exist in production, so a controlled promotion process is needed before launch. The audit found exactly **one** complete production-returnable sequence in the audited development dataset; this is a finding about that dataset only — production Neon was not inspected or updated.
+- **Current phase:** Phase 4B — Session & message persistence core
+- **Current phase status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-19)**
+- **Last implemented phase:** Phase 4B
+- **Last phase with tests passed:** Phase 4B — `npm test` 56/56 in 5 files (DB-free); `npm run test:db` 27/27 in 3 files (twice, for concurrency stability); `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate` passed on 2026-11-17.
+- **Last phase approved by user:** Phase 4B (2026-11-19). The user explicitly approved the completed Phase 4B result. Phase 4A was approved by the user on 2026-11-17.
+- **Next phase awaiting authorization:** Phase 5 — Knowledge service with safety, scope, and environment policy (NOT STARTED; separate authorization required)
+- **Outstanding decisions:** D1 resolved; D2 resolved; D3 resolved; D4 resolved for the Phase 3 contract (`POST /diagnosis/:id/confirm` with `{ challengeId }`, server-issued and validated against persisted state in a later phase; no client-provided verdict); D5 resolved for the Phase 3 contract (`POST /diagnosis/:id/complete` with `{ acknowledged: true }`); D6 initial parts provider enablement/keys (open); D7 streaming priority (open); D8 resolved for Phase 3 (minimal CORS implemented; rate limiting deferred); D9 resolved (separate isolated Neon project `fixit-test`, not a child branch); D10 resolved (option C hybrid)
+- **Last progress update:** 2026-11-17 — Phase 4A implemented and tested after explicit authorization, then **explicitly approved by the user on 2026-11-17** after confirming the tables were created in `fixit-test`. Added `.env.test.example`, `vitest.db.config.ts`, and `tests/db/{setup-db-env,helpers,guards.test,smoke.test}.ts`; wired `npm run test:db`; hardened `vitest.config.ts` so plain `npm test` stays DB-free. The fail-closed guard allows only the two exact `fixit-test` hosts, requires `RUN_DB_TESTS=1`, rejects production/development hosts, and never prints credentials. One-time `prisma migrate deploy` applied all four existing migrations to the isolated `fixit-test` project (PostgreSQL 18.7) only; enum, nullable columns, empty tables, migration history and a sentinel marker were verified. `npm test` 37/37 (DB-free), `npm run test:db` 15/15, typechecks and build pass. No application service, controller, route, validator, schema, migration or seed change; no development/production access; no staging or commit. Phase 3 remains approved and its record is preserved below. **Phase 4B was subsequently explicitly authorized by the user, implemented, tested, and explicitly approved by the user on 2026-11-19; it is APPROVED BY USER.** Phase 4B added `src/types/diagnosis.dto.ts`, `tests/db/diagnosis.integration.test.ts`, and `tests/docs/openapi.contract.test.ts`; modified the two diagnosis services, `src/docs/openapi.ts`, `tests/http/diagnosis.routes.test.ts`, `tests/db/helpers.ts`, and this file. Five APIs persist sessions/messages with owner-scoped queries, explicit DTOs, a creation transaction and a conditional OPEN-state message write; confirm/complete still return 501. `npm test` 56/56 (DB-free), `npm run test:db` 27/27 on `fixit-test` twice, typechecks, build and `prisma validate` pass. An initial transient DNS failure affected the first DB run; it resolved on retry. No schema, migration, seed, controller, route or validator change; no development/production access; no staging or commit. **Production knowledge promotion is still required:** development knowledge does not automatically exist in production.
 
 **Status values (use consistently):** `NOT STARTED` | `IN PROGRESS` | `IMPLEMENTED` | `TESTS PASSED` | `APPROVAL PENDING` | `APPROVED BY USER`
 **Rule:** distinguish implementation completion, successful testing, and explicit user approval. Never mark `APPROVED BY USER` without the user's explicit approval.
@@ -424,13 +474,18 @@ raw payloads. Store the access token in secure storage, send it as
 ### Current starting position (recorded)
 
 - Phases 1–9 are **planned and reviewed**; the implementation roadmap is **approved** as the plan.
-- **Phase 1 is APPROVED BY USER (2026-11-16).** Its migration is applied and verified on the development branch. No migration was applied to production, and no implementation phase beyond Phase 2 has been started.
-- **Phase 2 is APPROVED BY USER (2026-11-17); implementation and tests completed 2026-11-16.** The user independently ran and verified `npm test` (14 tests passed across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate`; all passed. Phase 2 added only environment, dependency, and test-harness infrastructure; no database access, schema/migration/seed change, or diagnosis behavior. Phase 3 remains NOT STARTED.
-- **No seed was run during Phase 1 or Phase 2. No production database was accessed.**
+- **Phase 1 is APPROVED BY USER (2026-11-16).** Its migration is applied and verified on the development branch. No migration was applied to production.
+- **Phase 2 is APPROVED BY USER (2026-11-17); implementation and tests completed 2026-11-16.** The user independently ran and verified `npm test` (14 tests passed across 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate`; all passed. Phase 2 added only environment, dependency, and test-harness infrastructure; no database access, schema/migration/seed change, or diagnosis behavior.
+- **Phase 3 is APPROVED BY USER (2026-11-17).** The user explicitly authorized Phase 3 with D4/D5/D8 decisions, then explicitly approved the completed phase after the final read-only review. Implementation added HTTP scaffolding only. Phase 4A is implemented, tested, and **APPROVED BY USER (2026-11-17)**. Phase 4B was later authorized by the user, implemented, tested, and **APPROVED BY USER (2026-11-19)**; nothing was staged or committed.
+- **Phase 4A (2026-11-17): IMPLEMENTED; TESTS PASSED; APPROVED BY USER (2026-11-17).** The user authorized only test infrastructure and one-time provisioning of `fixit-test`, then explicitly approved the completed phase after confirming the tables were successfully created in the isolated `fixit-test` Neon project. D9 is resolved by a separate isolated Neon project, not a child branch. Four existing migrations were deployed to `fixit-test` with `prisma migrate deploy` and verified; a sentinel marker was added. No application service, controller, route, validator, Prisma schema, existing migration or seed logic was changed.
+- **Phase 4B (2026-11-17 implemented; APPROVED BY USER 2026-11-19): IMPLEMENTED; TESTS PASSED; APPROVED BY USER (2026-11-19).** The user explicitly authorized the implementation plan, including all five APIs, Swagger documentation, integration tests, and the optional-model-number requirement, then explicitly approved the completed result on 2026-11-19. Five endpoints now persist conversations only; no AI, knowledge, verdict, confirmation or completion logic was added. No schema/migration/seed change; no development/production access; no staging or commit.
+- **No seed was run during Phases 1–4B. No production database was accessed; no development database was accessed during Phase 4A or 4B.**
+- **Phase 3 scope/decisions (implemented):** seven authenticated routes under `/diagnosis`; `createSessionSchema` requires `applianceId` plus at least one of `symptom`/`errorCode` (no model number needed in the request — older appliances are supported through an `Appliance` with no `modelNumber`); pagination `page=1`, `limit=20`, max 100; `501 NOT_IMPLEMENTED` stubs; `POST /diagnosis/:id/confirm` with `{ challengeId }` and `POST /diagnosis/:id/complete` with `{ acknowledged: true }`; minimal CORS, rate limiting deferred; `src/docs/**` untouched at that time.
+- **Phase 4B scope/decisions (implemented):** five persistence APIs implemented; `SessionDto`/`MessageDto`/paginated DTO mappers with explicit selects; creation transaction verifies appliance ownership then writes the session and one initial USER message; initial message maps `symptom` then `errorCode` (newline-separated when both supplied), with no model-number inference or knowledge lookup; message sending uses an owner-scoped OPEN-state conditional `updateMany` inside a transaction; confirm/complete stay 501; OpenAPI documents all seven endpoints; DB-free contract tests guard spec/validator/DTO drift.
 - **Phase 2 scope/decisions (implemented):** `groq-sdk` 1.6 + Vitest 5/Vite 8/Supertest 7; pure `env.schema.ts` + side-effecting `env.ts`; `NODE_ENV` required; only `GROQ_API_KEY`, `GROQ_MODEL`, and `ALLOW_UNREVIEWED_KNOWLEDGE` added; production rejects a missing Groq key and rejects unreviewed knowledge; `npm test` = `vitest run`; tests refuse `NODE_ENV=production` and use dummy credentials. Deferred: `GROQ_TIMEOUT_MS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_TOOL_ROUNDS`, `FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER`.
 - **Phase 1 scope/decisions (implemented):** `Verdict` is now `FIXED, NEEDS_PART, TECHNICIAN_REQUIRED, UNRESOLVED`; migration `20261116093023_verdict_pending_confirmation` safely renames `CALL_TECHNICIAN` → `TECHNICIAN_REQUIRED` and adds `UNRESOLVED`; `DiagnosisSession` gained the three approved nullable/server-managed fields `fixConfirmationChallengeId`, `fixConfirmationIssuedAt`, and `fixConfirmationExpiresAt` (single-use `FIXED` confirmation challenge persisted across requests; `Message` content is not authoritative). MVP keeps `applianceId`-based context (no ad-hoc snapshot columns).
 - **Preflight/apply state (development branch):** before apply, 3 migrations were applied; `Verdict` was `FIXED, NEEDS_PART, CALL_TECHNICIAN`; 0 `DiagnosisSession` rows; no `fixConfirmation*` columns. After explicit authorization, the migration was applied: the enum now has all four values, all three nullable columns exist, and `_prisma_migrations` records the migration as finished. Knowledge-base row counts were unchanged (15 sources, 77 error codes, 117 repair steps, 188 links) and diagnosis sessions remain 0.
-- **Baseline repo state at Phase 1 start:** diagnosis routes/controller/services are scaffolded/unwired (router not mounted in `app.ts`, controller empty, services empty); no `groq-sdk`, no test runner. Undocumented uncommitted Swagger/OpenAPI work exists and was preserved untouched. At Phase 2 start those dependencies and the test runner were still absent; Phase 2 added them.
+- **Baseline repo state at Phase 1 start:** diagnosis routes/controller/services are scaffolded/unwired (router not mounted in `app.ts`, controller empty, services empty); no `groq-sdk`, no test runner. Swagger/OpenAPI work was described as uncommitted in earlier notes; at Phase 3 start the working tree was clean and that work was present in commit `15ccfeb`. Phase 2 added the dependencies and test runner; Phase 3 wired the HTTP scaffold and preserved `src/docs/**` byte-identical.
 
 ### Permanent implementation workflow (follow in every future session)
 
@@ -474,12 +529,12 @@ raw payloads. Store the access token in secure storage, send it as
 | D1 | `Verdict` enum migration mapping/SQL strategy for `CALL_TECHNICIAN`→`TECHNICIAN_REQUIRED` and handling of any existing rows; generate-only vs apply in Phase 1 | **Resolved 2026-11-16** | In-place `ALTER TYPE ... RENAME VALUE` preserves existing values; `ADD VALUE 'UNRESOLVED'`. Generated and reviewed first, then applied to development via `migrate deploy` after separate explicit authorization. Preflight found 0 `DiagnosisSession` rows; post-apply verification passed. Production untouched. |
 | D2 | Test stack & scripts (`vitest`+`supertest` or alternative) | **Resolved 2026-11-16** | Vitest 5.1 + Vite 8.3.8 + Supertest 7.3.2; `npm test` = `vitest run`, with `test:watch` kept separate. Coverage/browser tooling deferred. |
 | D3 | Default Groq model id (tool-capable, env-configurable) | **Resolved 2026-11-16** | Default `openai/gpt-oss-120b`, overridable with `GROQ_MODEL`; no AI client code or API calls were implemented in Phase 2. |
-| D4 | Explicit `FIXED` confirmation action form/contract (e.g. dedicated endpoint/flag) matched to pending challenge | Open | Affects Phases 2–5/7 validators/routes/logic. |
-| D5 | `NEEDS_PART` completion trigger (explicit end/ack action and/or deterministic no-further-in-app-action rule) | Open | Affects Phases 3–4/7 transitions. |
+| D4 | Explicit `FIXED` confirmation action form/contract (e.g. dedicated endpoint/flag) matched to pending challenge | **Resolved 2026-11-17 (Phase 3 contract)** | `POST /diagnosis/:id/confirm` with `{ challengeId }`; the challenge must be server-issued and checked against persisted state in a later phase. No client-provided verdict is accepted. |
+| D5 | `NEEDS_PART` completion trigger (explicit end/ack action and/or deterministic no-further-in-app-action rule) | **Resolved 2026-11-17 (Phase 3 contract)** | `POST /diagnosis/:id/complete` with `{ acknowledged: true }`; deterministic no-further-action rule still belongs to Phase 7. |
 | D6 | Initial parts provider enablement (`none` default vs specific provider/API key) | Open | Affects Phase 8. |
 | D7 | Streaming priority (JSON-only MVP vs include SSE) | Open | Affects Phase 9 scope/timing. |
-| D8 | CORS and/or basic rate limiting in-scope | Open | Affects Phase 3/9 hardening. |
-| D9 | Test database strategy | **Resolved 2026-11-16** | No database access in Phase 2 (unit/HTTP smoke only). A dedicated Neon test branch must be created before Phase 4 database integration tests; the development branch is not used as a test database because it holds approved knowledge. |
+| D8 | CORS and/or basic rate limiting in-scope | **Resolved 2026-11-17 (Phase 3 scope)** | Minimal CORS implemented in Phase 3 (`Origin` reflection + preflight); strict allowlist and rate limiting deferred to Phase 9. |
+| D9 | Test database strategy | **Resolved 2026-11-17** | No database access in Phase 2. Phase 4A uses a separate, isolated Neon project `fixit-test` (PostgreSQL 18.7), **not** a child branch of the development project, avoiding knowledge contamination. Four migrations were deployed and verified there; development and production were untouched. |
 | D10 | Symptom-based diagnosis knowledge strategy | **Resolved 2026-11-16 — option C (hybrid)** | MVP uses approved error-code knowledge with symptom-based questioning and candidate narrowing. AI candidate codes are hypotheses, never confirmed diagnoses; the backend validates candidates against applicable knowledge before any repair instructions. A dedicated reviewed symptom/cause knowledge model may be added later if needed. |
 
 ### Complete approved implementation checklist (Phases 1–9)
@@ -562,8 +617,9 @@ raw payloads. Store the access token in secure storage, send it as
 |---|---|---|---|---|---|---|---|---|
 | 1 | APPROVED BY USER (2026-11-16); migration applied and verified on development | `prisma/schema.prisma`; `prisma/migrations/20261116093023_verdict_pending_confirmation/migration.sql`; `CONTEXT.md`; `database_design/DATABASE_DESIGN.md`; regenerated gitignored `src/generated/prisma/**` | `Verdict` → FIXED/NEEDS_PART/TECHNICIAN_REQUIRED/UNRESOLVED; added nullable `fixConfirmationChallengeId`, `fixConfirmationIssuedAt`, `fixConfirmationExpiresAt`; migration generated, reviewed, then applied to the development branch | Preflight read-only DB; `prisma validate` pass; `prisma migrate diff` SQL reviewed; `prisma generate` pass; `tsc --noEmit` pass; `prisma migrate deploy` applied the pending migration; post-apply DB verification pass; `prisma migrate status` reports schema up to date; final `prisma validate` + `tsc --noEmit` pass | Migration executed successfully; post-apply enum/columns/migration-record checks passed; no automated test runner exists | `migrate dev --create-only` is non-interactive-unsupported; used read-only `migrate diff` + hand-created migration dir, then `migrate deploy`. No drift detected; no production access; no seed run. | D1 resolved | Yes — Phase 1 approved by user 2026-11-16 |
 | 2 | APPROVED BY USER (2026-11-17); implemented and tested 2026-11-16 | `src/config/env.schema.ts` (new); `src/config/env.ts`; `src/server.ts`; `.env.example`; `.gitignore`; `package.json`; `package-lock.json`; `vitest.config.ts` (new); `tsconfig.test.json` (new); `tests/setup-env.ts`, `tests/config/env.test.ts`, `tests/http/app.test.ts`, `tests/dependencies/groq-sdk.test.ts` (new); `CONTEXT.md` | None | `npm install groq-sdk@^1.6.0`; `npm install -D vitest@^5.1.0 vite@^8.3.8 supertest@^7.3.2 @types/supertest@^7.2.1`; `npm run typecheck` pass; `npm run typecheck:test` pass; `npm test` 14/14 pass; `npm run build` pass; `npx prisma validate` pass; production-guard commands exit 1 as expected; development env load exits 0; protected file hashes unchanged; lockfile has 0 missing pre-existing package keys | 3 files / 14 tests pass (independently re-run and verified by the user on 2026-11-17); no DB, network, or AI calls | No DB access; no schema/migration/seed/app/diagnosis/Swagger changes; `GROQ_TIMEOUT_MS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_TOOL_ROUNDS`, `FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER` deferred | D2, D3 resolved; D9, D10 resolved | Yes — Phase 2 approved by user 2026-11-17; user independently ran and verified `npm test` (14 tests / 3 files), `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `npx prisma validate` (all passed) |
-| 3 | NOT STARTED | — | None | — | Not run | — | D4, D5, D8 | No |
-| 4 | NOT STARTED | — | None | — | Not run | — | D4, D5 | No |
+| 3 | APPROVED BY USER (2026-11-17) | Created `src/validators/diagnosis.validator.ts`, `src/middleware/cors.ts`, `tests/http/diagnosis.routes.test.ts`; modified `src/app.ts`, `src/middleware/validate.ts`, `src/types/express.d.ts`, `src/routes/diagnosis.routes.ts`, `src/controllers/diagnosis.controller.ts`, `src/services/diagnosis.service.ts`, `src/services/session.service.ts`, `CONTEXT.md` | None | `npm run typecheck` pass; `npm run typecheck:test` pass; `npm test` 37/37 in 4 files; `npm run build` pass; `git status` on branch `feat/backend-setup`; Swagger file hashes unchanged | 37 tests pass across 4 files (23 new); no DB/network/AI calls | D4/D5/D8 resolved for contract/CORS; no schema, migration, seed, Prisma/Groq imports, verdict mutation or persistence; remaining non-blocking issues recorded below (permissive CORS, malformed-JSON 500, minor test gaps, stale Swagger docs); documented Swagger work was already committed at Phase 3 start | D4, D5, D8 resolved | Yes — Phase 3 explicitly approved by user 2026-11-17 after final read-only review |
+| 4A | APPROVED BY USER (2026-11-17) | Created `.env.test.example`, `vitest.db.config.ts`, `tests/db/setup-db-env.ts`, `tests/db/helpers.ts`, `tests/db/guards.test.ts`, `tests/db/smoke.test.ts`; modified `.gitignore`, `vitest.config.ts`, `tsconfig.test.json`, `package.json`, `CONTEXT.md` | No repo schema/migration change; 4 existing migrations deployed to `fixit-test` only, plus an idempotent sentinel table outside Prisma migrations | credential-free `.env.test` verification; `prisma migrate deploy` (4 applied); `prisma migrate status` up to date; PG 18.7 confirmed; enum/columns/empty tables/sentinel verified; `npm test` 37/37; `npm run test:db` 15/15; typecheck, test-typecheck, build pass; negative guard runs exit 1 | 37 DB-free + 15 DB tests pass; production/opt-out/dev-host runs fail closed before connecting | Extra `smoke.test.ts`; `vitest.config.ts` excludes `tests/db`; Prisma 7 uses `finished_at`/`rolled_back_at`; temporary provisioning script removed; non-blocking pg SSL warning | D9 resolved by separate project | Yes — Phase 4A explicitly approved by user 2026-11-17 after confirming the `fixit-test` tables were created |
+| 4B | APPROVED BY USER (2026-11-19); IMPLEMENTED; TESTS PASSED | Created `src/types/diagnosis.dto.ts`, `tests/db/diagnosis.integration.test.ts`, `tests/docs/openapi.contract.test.ts`; modified `src/services/session.service.ts`, `src/services/diagnosis.service.ts`, `src/docs/openapi.ts`, `tests/http/diagnosis.routes.test.ts`, `tests/db/helpers.ts`, `CONTEXT.md` | None (no schema/migration/seed change; `Appliance.modelNumber` already nullable) | `npm test` 56/56 (DB-free); `npm run test:db` 27/27 on `fixit-test` twice; `npm run typecheck`, `npm run typecheck:test`, `npm run build`, `npx prisma validate` pass; `git status --short --branch` checked | 56 DB-free + 27 DB tests pass; first DB run blocked by transient DNS failure, resolved on retry, two full passing runs after; no dev/prod access | Initial DB run hit transient `ENOTFOUND` for the allowlisted `fixit-test` hosts; no code change was needed. No staging or commit. | — | Yes — Phase 4B explicitly approved by user 2026-11-19 |
 | 5 | NOT STARTED | — | None | — | Not run | — | — | No |
 | 6 | NOT STARTED | — | None | — | Not run | — | D3 | No |
 | 7 | NOT STARTED | — | None | — | Not run | — | D4, D5 | No |
@@ -710,3 +766,270 @@ development dataset only. **Production Neon was not inspected or updated.**
 
 **User approval:** Yes — Phase 2 was explicitly approved by the user on 2026-11-17 after
 independently running and verifying the commands listed above.
+
+### Phase 3 implementation record (2026-11-17)
+
+**Status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-17)**. The user explicitly
+authorized Phase 3 only, set the final contract decisions below, and approved the completed
+phase after the final read-only review. Nothing was staged or committed.
+
+**Authorized decisions:**
+- D4: `POST /diagnosis/:id/confirm` with `{ challengeId }`; the challenge must eventually be
+  server-issued and validated against persisted state. No client-provided verdict.
+- D5: `POST /diagnosis/:id/complete` with `{ acknowledged: true }`.
+- D8: minimal CORS for frontend integration; rate limiting deferred.
+- Seven endpoints under `/diagnosis`; pagination `page=1`, `limit=20`, max 100; valid scaffold
+  requests return `501 NOT_IMPLEMENTED`, never fake success or hang.
+- `applianceId` required on create plus at least one of `symptom`/`errorCode`; no model number
+  is required in the request, so older appliances without a known model number are supported.
+- Session operations stay in `session.service.ts`; diagnosis/message/confirmation/completion
+  operations stay in `diagnosis.service.ts`; stubs throw `HttpError(501, 'NOT_IMPLEMENTED', ...)`.
+- Auth runs before validation; query parsing uses `req.validatedQuery`; existing envelopes and
+  validation behaviour preserved; tests cover auth, validation, pagination, 501 and 404.
+- No DB access, Prisma imports in new services, Groq calls, knowledge retrieval, verdict
+  mutation, persistence, schema/migration/seed changes, staging or committing.
+- `src/docs/**` untouched until Phase 9.
+
+**Files created:**
+- `src/validators/diagnosis.validator.ts`
+- `src/middleware/cors.ts`
+- `tests/http/diagnosis.routes.test.ts`
+
+**Files modified:**
+- `src/app.ts` (added CORS middleware, diagnosis import and `/diagnosis` mount only)
+- `src/middleware/validate.ts` (shared validation-error helper; `validateParams`, `validateQuery`)
+- `src/types/express.d.ts` (`req.validatedQuery?: unknown`)
+- `src/routes/diagnosis.routes.ts` (seven routes with auth-first middleware chains)
+- `src/controllers/diagnosis.controller.ts` (thin handlers, owner id from `req.user`)
+- `src/services/diagnosis.service.ts`, `src/services/session.service.ts` (501 stubs)
+- `CONTEXT.md`
+
+**Commands executed and results (from `fixit-backend/`):**
+- `npm run typecheck` — passed.
+- `npm run typecheck:test` — passed.
+- `npm test` — **37 tests passed in 4 files** (23 new diagnosis tests).
+- `npm run build` — passed.
+- `git status --porcelain=v1` / `git branch --show-current` — branch `feat/backend-setup`;
+  only the Phase 3 files above are modified/untracked; no staging or commits.
+- `git hash-object src/docs/openapi.ts src/docs/swagger.ts` before and after — unchanged
+  (`5b01e0dc…`, `7a1d31f3…`).
+
+**Test coverage:** missing/invalid bearer token → 401; auth before body validation; invalid
+body, missing applianceId, missing symptom/errorCode, malformed IDs → 400 `VALIDATION_ERROR`;
+pagination `page=0`, `limit=101`, non-numeric limit → 400; empty message, missing challengeId,
+`acknowledged:false` → 400; all seven valid routes → 501 `NOT_IMPLEMENTED` with the exact
+error envelope; unknown nested route → 404 `NOT_FOUND`; CORS Origin reflection and 204 preflight.
+No test opens a database connection or makes a network/Groq call.
+
+**Issues/deviations:**
+- Earlier notes described the Swagger work as uncommitted; at Phase 3 start the tree was clean
+  and `src/docs/**` was present in commit `15ccfeb`. It was preserved byte-identical.
+- No environment variables, dependencies, Prisma schema/migrations/seeds or database records
+  were changed. No production access.
+
+**Remaining non-blocking issues (recorded at final read-only review):**
+- Permissive CORS: `corsMiddleware` reflects any request `Origin`. No `Access-Control-Allow-Credentials`
+  header is set, which is correct for Bearer-token auth, but a strict allowlist is deferred to
+  Phase 9 hardening. Rate limiting was also deferred.
+- Malformed JSON bodies currently return `500 INTERNAL_ERROR` instead of `400`. The central
+  `errorHandler` maps every non-`HttpError` to 500 and does not inspect body-parser's `status`.
+  This is pre-existing (it also affects `/auth/*`), was not introduced or changed in Phase 3,
+  and should be tracked for a later fix/Phase 9 hardening.
+- Minor test coverage gaps: missing-auth is asserted for `POST /diagnosis` but not individually
+  for all seven routes; absence of `Access-Control-Allow-Credentials` is not explicitly asserted;
+  accepted pagination boundaries (`limit=100`, `limit=1`, `page=1`) are not tested; trimming and
+  max-length boundaries for `symptom`/`errorCode` are not tested; expired/wrong-signature JWTs
+  and malformed JSON bodies are not covered. None of these block Phase 4.
+- Swagger diagnosis documentation remains stale: `src/docs/openapi.ts` still describes `/diagnosis`
+  as “NOT MOUNTED” / deprecated. It was deliberately left untouched per the approved decision;
+  alignment with the live routes is deferred to Phase 9.
+
+**User approval:** Yes — Phase 3 was explicitly approved by the user on 2026-11-17 after the
+final read-only review. Phase 4 was not started.
+
+### Phase 4A implementation record (2026-11-17) — approved by user
+
+**Status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-17)**. The user authorized Phase 4A
+only. Phase 4B was not started; nothing was staged or committed.
+
+**Authorized scope:** environment separation, a separate fail-closed database test runner,
+one-time provisioning of `fixit-test` with `prisma migrate deploy`, a test-database sentinel,
+and documentation. No diagnosis/session service, controller, route, validator, Prisma schema,
+existing migration, or seed logic was touched.
+
+**Database topology (D9 resolved):** `fixit-development-preserved` is the primary development
+Neon project; its current direct host is
+`ep-winter-credit-ao2gv7ym.c-2.ap-southeast-1.aws.neon.tech`. The older
+`ep-shy-glade-a1uvm947` host belongs to the original development project, not the preserved
+one. `fixit-test` is an entirely separate Neon project (PostgreSQL 18.7) with direct host
+`ep-withered-mode-aoa83pzz.c-2.ap-southeast-1.aws.neon.tech` and pooled host
+`ep-withered-mode-aoa83pzz-pooler.c-2.ap-southeast-1.aws.neon.tech`. These two hosts are the
+exact allowlist; every other host is rejected. Production was never contacted.
+
+**Files created:**
+- `.env.test.example` (placeholders only: `TEST_DATABASE_URL`, `TEST_DIRECT_URL`, `RUN_DB_TESTS=0`)
+- `vitest.db.config.ts`
+- `tests/db/setup-db-env.ts` (pure `assertDbTestEnv` plus opt-in/host guard)
+- `tests/db/helpers.ts`
+- `tests/db/guards.test.ts`
+- `tests/db/smoke.test.ts` (additional to the minimum list: read-only schema checks)
+
+**Files modified:**
+- `.gitignore` — preserved the pre-existing `.env.test` line; added `!.env.test.example`
+- `vitest.config.ts` — `exclude: [...configDefaults.exclude, 'tests/db/**']` so `npm test` stays DB-free
+- `tsconfig.test.json` — added `vitest.db.config.ts` to `include`
+- `package.json` — added `test:db`
+- `CONTEXT.md` — this record and the topology/test-infrastructure updates above
+
+**Not changed:** `.env`, `.env.test`, `.env.example`, `prisma/**`, `prisma.config.ts`,
+`src/**` (including all services, controllers, routes, validators, seed, and Swagger docs),
+all Phase 1–3 working-tree changes, and all development/production database records.
+
+**Commands executed and results (from `fixit-backend/`):**
+- Read-only inspection: `git status --short`, `git log -1 --oneline`, `git branch --show-current`,
+  `git diff --numstat`, `git status --porcelain=v1`. Branch `feat/backend-setup`, HEAD `15ccfeb`;
+  all Phase 3 changes preserved. No `bun.lock` (npm project).
+- `npm run typecheck` — passed (twice, before and after final edits).
+- `npm run typecheck:test` — passed (twice).
+- `npm test` — **37 tests passed in 4 files**, twice; no database connection or SSL warning.
+- `npm run build` — passed.
+- Credential-free `.env.test` check: dotenv parse booleans only — hostnames matched the exact
+  allowlist, both URLs had the same database name, `RUN_DB_TESTS` present and equal to `1`.
+  No connection string, username, password, or file content was printed.
+- Temporary provisioning script (created, run, then removed): first two attempts stopped
+  before any write (fresh DB has no tables; Windows `spawnSync` could not launch bare `npx`);
+  the third applied all four migrations and stopped only on a verification query that used a
+  pre-Prisma-7 column name; the fourth re-ran the now-idempotent verification to completion.
+- `npx prisma migrate deploy` (with test-only `DIRECT_URL`/`DATABASE_URL` supplied via env) —
+  applied `20261113122829_init`, `20261113130000_add_user_auth`,
+  `20261114090000_add_refresh_token_family`, and
+  `20261116093023_verdict_pending_confirmation`; no seed, no `db push`, no `migrate dev`,
+  no reset/drop.
+- `RUN_DB_TESTS=1 NODE_ENV=test npm run test:db` — **15 tests passed in 2 files**.
+- `NODE_ENV=production RUN_DB_TESTS=1 npm run test:db` — exited 1 at `tests/setup-env.ts`
+  before any connection.
+- `RUN_DB_TESTS=0 npm run test:db` — exited 1 at `assertDbTestEnv` before any connection.
+- `TEST_DATABASE_URL=<development host> RUN_DB_TESTS=1 npm run test:db` — exited 1 at
+  `assertDbTestEnv` (host not in allowlist) before any connection.
+- `npm run test:db` with the local `.env.test` — passed 15/15 because that file supplies
+  `RUN_DB_TESTS=1`; the committed example uses `0`.
+
+**Migration and database verification results (`fixit-test` only):**
+- PostgreSQL version reported as **18.7**; Prisma 7.10.1 + `@prisma/adapter-pg` applied all
+  four migrations successfully — no compatibility failure.
+- Before deploy: 0 finished migrations; application tables absent/empty.
+- After deploy: 4 expected migrations finished, none rolled back; `prisma migrate status`
+  reported “Database schema is up to date!”.
+- `Verdict` enum = `FIXED, NEEDS_PART, TECHNICIAN_REQUIRED, UNRESOLVED`.
+- `DiagnosisSession.fixConfirmationChallengeId`, `fixConfirmationIssuedAt`, and
+  `fixConfirmationExpiresAt` all exist and are nullable.
+- All nine application tables (including knowledge tables) are empty; no seed ran.
+- Idempotent sentinel table `_fixit_test_sentinel` created with exactly one
+  `fixit-test-phase4a` marker row, then verified.
+- Only the `fixit-test` direct endpoint was used for provisioning/verification and its pooled
+  endpoint for runtime smoke checks. **Development and production were never contacted.**
+
+**Fail-closed design:** `tests/db/setup-db-env.ts` checks inherited `NODE_ENV` before changing
+it, requires `RUN_DB_TESTS=1`, requires both `TEST_*` URLs, parses hostnames with `new URL`,
+rejects the current and legacy development hosts and anything not in the exact two-host
+allowlist, then overwrites the dummy `DATABASE_URL` from `tests/setup-env.ts`. Error messages
+name only variables, never values, hosts, or credentials. `.env` is never auto-loaded by the
+DB runner (`envDir: false`), and `.env.test` is loaded only by the guard.
+
+**Issues/deviations:** added `tests/db/smoke.test.ts` beyond the minimum file list; modified
+`vitest.config.ts` to exclude `tests/db`; used a temporary provisioning script that was
+removed; Prisma 7's migration table uses `finished_at`/`rolled_back_at` rather than the older
+`finished`/`rolled_back` columns; a non-blocking `pg` SSL-mode deprecation warning was emitted;
+the local `.env.test` already contains `RUN_DB_TESTS=1`. No safety check failed at completion.
+
+**User approval:** Yes — Phase 4A was explicitly approved by the user on 2026-11-17 after the
+user confirmed that the tables were successfully created in the isolated `fixit-test` Neon
+project. Phase 4B was subsequently authorized separately and is recorded below.
+
+### Phase 4B implementation record (2026-11-17) — approved by user 2026-11-19
+
+**Status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-19)**. The user explicitly authorized the
+Phase 4B plan (five database-backed APIs, Swagger documentation, integration testing, and the
+optional appliance model-number requirement), then explicitly approved the completed result on
+2026-11-19.
+
+**Implemented behaviour:**
+- `POST /diagnosis` — inside one Prisma transaction: verifies `applianceId` belongs to
+  `req.user.id`, creates the session (`OPEN`, `verdict=null`, no `errorCodeId`), and writes one
+  initial `USER` message. Returns 201 `SessionDto`. Missing or non-owned appliances both give
+  404 `APPLIANCE_NOT_FOUND`. The initial message content is `symptom`, `errorCode`, or both
+  newline-separated in validator order; no model number is inferred and no knowledge lookup
+  occurs.
+- `GET /diagnosis` — owner-scoped page of `SessionDto` (`page=1`, `limit=20`, max 100),
+  ordered `createdAt DESC, id DESC`, with `items/page/limit/total/totalPages`.
+- `GET /diagnosis/:id` — owner-scoped single `SessionDto`; nonexistent and non-owned ids return
+  the identical 404 `SESSION_NOT_FOUND`.
+- `GET /diagnosis/:id/messages` — ownership check, then `MessageDto` page ordered
+  `createdAt ASC, id ASC`.
+- `POST /diagnosis/:id/messages` — ownership check, 409 `SESSION_CLOSED` for non-OPEN sessions,
+  then an owner+OPEN conditional `updateMany` inside a transaction before the `Message` insert.
+  A concurrent close cannot be overwritten. Returns 201 `MessageDto`.
+- `POST /diagnosis/:id/confirm` and `POST /diagnosis/:id/complete` remain 501
+  `NOT_IMPLEMENTED`.
+
+**DTO/security:** `src/types/diagnosis.dto.ts` defines explicit `sessionDtoSelect`,
+`messageDtoSelect`, `toSessionDto`, `toMessageDto`, `toPaginatedDto`, and their types. Response
+queries select only DTO fields; `userId`, `errorCodeId`, `fixConfirmationChallengeId`,
+`fixConfirmationIssuedAt`, `fixConfirmationExpiresAt` and user data are never mapped into
+responses. Every query derives identity from `req.user.id` and uses owner-scoped `where`
+clauses; no client-provided user id is trusted.
+
+**Optional model number:** no schema change was needed — `Appliance.modelNumber` is already
+nullable. Null, empty-string and unspecified values are accepted unchanged by session creation
+and message persistence, are never invented, and are never treated as a wildcard for
+model-specific knowledge (no knowledge retrieval exists in this phase). Integration tests cover
+all three cases.
+
+**Files created:**
+- `src/types/diagnosis.dto.ts`
+- `tests/db/diagnosis.integration.test.ts`
+- `tests/docs/openapi.contract.test.ts`
+
+**Files modified:**
+- `src/services/session.service.ts`, `src/services/diagnosis.service.ts`
+- `src/docs/openapi.ts`
+- `tests/http/diagnosis.routes.test.ts`, `tests/db/helpers.ts`
+- `CONTEXT.md`
+
+**Not changed:** `prisma/schema.prisma`, migrations, seed logic, `src/app.ts`,
+`src/routes/diagnosis.routes.ts`, `src/controllers/diagnosis.controller.ts`,
+`src/validators/diagnosis.validator.ts`, `src/docs/swagger.ts`, `package.json`, `.env*`,
+frontend files, and any development/production database record. Swagger UI still uses the
+existing `swagger-ui-express` dependency at `/docs` with raw JSON at `/docs/openapi.json`;
+no duplicate dependency was installed. Try it out and Authorize remain enabled by the existing
+UI setup plus the documented `bearerAuth` scheme and per-operation `security`.
+
+**Commands executed and results (from `fixit-backend/`):**
+- `npm test` — **56 tests passed in 5 files** (DB-free, includes 20 new OpenAPI contract tests).
+- `npm run test:db` — **27 tests passed in 3 files** on `fixit-test` only, on two consecutive
+  full runs. Covers creation/initial message, ownership and missing appliance, all
+  model-number variants, rollback via a forced mid-transaction failure, listing/pagination/
+  ordering, retrieval, message listing/sending, closed-session rejection, a row-lock race
+  proving the conditional OPEN gate, and the two remaining 501 stubs.
+- `npm run typecheck` — passed. `npm run typecheck:test` — passed. `npm run build` — passed.
+  `npx prisma validate` — schema valid.
+- `git status --short --branch` — branch `feat/backend-setup`; only the expected Phase 1–4B
+  working-tree changes; no staged files and no commits.
+
+**Issues/deviations:** the first `npm run test:db` attempt failed at DNS resolution for the
+exact allowlisted `fixit-test` hosts (`ENOTFOUND`), including the pre-existing Phase 4A smoke
+tests; no credentials or connection strings were printed. The host resolved on retry and two
+subsequent full runs passed 27/27. A temporary credential-free connectivity probe was created
+and removed; it is not part of the repository. The non-blocking `pg` SSL-mode deprecation
+warning persists. The exact wording of the prior session's approved initial-message mapping was
+not present in `CONTEXT.md`; the implementation uses the validator-order mapping documented
+above and in the OpenAPI description. No unresolved functional issue remains.
+
+**Scope of this approval update (2026-11-19):** only `CONTEXT.md` was edited to record the
+Phase 4B approval. No application code, tests, Prisma schema/migrations, seed, configuration,
+or any other file in the codebase was changed. All prior records, decisions, status values,
+open work items, and known gaps below are preserved unchanged. Phase 5 was **not** started and
+requires separate explicit authorization.
+
+**User approval:** Yes — Phase 4B was explicitly approved by the user on 2026-11-19. It is
+IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-19)**.

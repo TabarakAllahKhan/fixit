@@ -5,6 +5,8 @@ declare global {
       user?: {
         id: string;
       };
+      // Set by validateQuery because Express 5's req.query is read-only.
+      validatedQuery?: unknown;
     }
   }
 }
