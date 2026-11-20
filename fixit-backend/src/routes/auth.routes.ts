@@ -9,7 +9,9 @@ import {
   refresh,
   register,
 } from '../controllers/auth.controller.js';
+import { env } from '../config/env.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { rateLimit } from '../middleware/rateLimit.js';
 import { validateBody } from '../middleware/validate.js';
 import {
   changePasswordSchema,
@@ -20,13 +22,16 @@ import {
 
 export const authRouter = Router();
 
-authRouter.post('/register', validateBody(registerSchema), register);
-authRouter.post('/login', validateBody(loginSchema), login);
-authRouter.post('/refresh', validateBody(refreshTokenSchema), refresh);
-authRouter.post('/logout', validateBody(refreshTokenSchema), logout);
+const authRateLimit = rateLimit({ name: 'auth', max: env.RATE_LIMIT_AUTH_MAX });
+
+authRouter.post('/register', authRateLimit, validateBody(registerSchema), register);
+authRouter.post('/login', authRateLimit, validateBody(loginSchema), login);
+authRouter.post('/refresh', authRateLimit, validateBody(refreshTokenSchema), refresh);
+authRouter.post('/logout', authRateLimit, validateBody(refreshTokenSchema), logout);
 authRouter.post(
   '/change-password',
   requireAuth,
+  authRateLimit,
   validateBody(changePasswordSchema),
   changePassword,
 );

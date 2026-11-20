@@ -1,22 +1,33 @@
 import type { NextFunction, Request, Response } from 'express';
+import { env } from '../config/env.js';
+import { sendError } from '../utils/apiResponse.js';
 
-// Minimal CORS for frontend integration. The Expo client authenticates with a
-// Bearer header rather than cookies, so no credentialed CORS is needed here.
-// Reflecting the Origin keeps local device/emulator/web origins working; a
-// strict allowlist belongs in the Phase 9 hardening pass.
+function allowedOrigins(): string[] {
+  return env.CORS_ALLOWED_ORIGINS.split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+// Browser origins are explicitly allowlisted. Native clients normally send no
+// Origin header and remain allowed; they authenticate with a Bearer header, so
+// credentialed CORS is not needed.
 export function corsMiddleware(req: Request, res: Response, next: NextFunction): void {
   const origin = req.headers.origin;
+  const allowed = origin ? allowedOrigins().includes(origin) : true;
 
-  if (origin) {
+  res.setHeader('Vary', 'Origin');
+  if (origin && allowed) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Max-Age', '600');
   }
 
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Max-Age', '600');
-
   if (req.method === 'OPTIONS') {
+    if (!allowed) {
+      sendError(res, 403, 'ORIGIN_NOT_ALLOWED', 'Origin is not allowed');
+      return;
+    }
     res.status(204).end();
     return;
   }

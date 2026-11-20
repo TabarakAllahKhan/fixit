@@ -8,7 +8,9 @@ import {
   listSessions,
   sendMessage,
 } from '../controllers/diagnosis.controller.js';
+import { env } from '../config/env.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { rateLimit } from '../middleware/rateLimit.js';
 import { validateBody, validateParams, validateQuery } from '../middleware/validate.js';
 import {
   completeSessionSchema,
@@ -21,6 +23,12 @@ import {
 } from '../validators/diagnosis.validator.js';
 
 export const diagnosisRouter = Router();
+
+const messageRateLimit = rateLimit({
+  name: 'diagnosis-message',
+  max: env.RATE_LIMIT_MESSAGE_MAX,
+  key: (req) => req.user?.id ?? req.ip ?? 'unknown',
+});
 
 // Authentication runs before request validation so an unauthenticated caller
 // cannot probe the validation rules.
@@ -37,6 +45,7 @@ diagnosisRouter.get(
 diagnosisRouter.post(
   '/:id/messages',
   requireAuth,
+  messageRateLimit,
   validateParams(sessionIdParamSchema),
   validateBody(sendMessageSchema),
   sendMessage,

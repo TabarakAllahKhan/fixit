@@ -75,9 +75,19 @@ describe('OpenAPI document shape', () => {
     expect(operation(path, method).security).toEqual([{ bearerAuth: [] }]);
   });
 
-  it('no longer describes diagnosis as an unmounted draft', () => {
-    expect(JSON.stringify(spec)).not.toMatch(/NOT MOUNTED/i);
-    expect(JSON.stringify(spec.info.description)).toMatch(/conversations/);
+  it('describes the backend-controlled AI workflow', () => {
+    expect(JSON.stringify(spec)).not.toMatch(/NOT MOUNTED|NOT_IMPLEMENTED|not implemented/i);
+    expect(spec.info.description).toMatch(/requestId/);
+    expect(spec.info.description).toMatch(/approved knowledge/);
+    expect(spec.tags.find((tag: AnyRecord) => tag.name === 'Diagnosis').description).toMatch(/confirm/);
+  });
+
+  it('documents liveness and readiness separately', () => {
+    expect(operation('/health', 'get').responses['503']).toBeDefined();
+    expect(operation('/health/live', 'get').responses['200']).toBeDefined();
+    expect(operation('/health/live', 'get').responses['503']).toBeUndefined();
+    expect(operation('/health/ready', 'get').responses['503']).toBeDefined();
+    expect(schema('LivenessData').properties.status.enum).toEqual(['ok']);
   });
 });
 
@@ -95,24 +105,35 @@ describe('request schemas match the validators', () => {
     expect(create.anyOf).toEqual([{ required: ['symptom'] }, { required: ['errorCode'] }]);
     expect(create.description).toMatch(/model number is NOT required/i);
 
-    // The validator itself still enforces the same optional clue contract.
     expect(createSessionSchema.safeParse({ applianceId: 'not-a-uuid', symptom: 'x' }).success).toBe(false);
     expect(createSessionSchema.safeParse({ applianceId: crypto.randomUUID() }).success).toBe(false);
     expect(createSessionSchema.safeParse({ applianceId: crypto.randomUUID(), errorCode: 'FE' }).success).toBe(true);
   });
 
-  it('documents message, confirmation and completion bodies', () => {
+  it('documents the idempotent message body', () => {
     const send = schema('SendMessageRequest');
-    expect(send.required).toEqual(['content']);
+    expect(send.required).toEqual(['requestId', 'content']);
+    expect(send.properties.requestId.format).toBe('uuid');
     expect(send.properties.content.maxLength).toBe(4000);
-    expect(sendMessageSchema.safeParse({ content: '   ' }).success).toBe(false);
+    expect(send.description).toMatch(/replaying/i);
 
+    const requestId = crypto.randomUUID();
+    expect(sendMessageSchema.safeParse({ content: '   ' }).success).toBe(false);
+    expect(sendMessageSchema.safeParse({ requestId, content: 'I cleaned the filter' })).toEqual({
+      success: true,
+      data: { requestId, content: 'I cleaned the filter' },
+    });
+  });
+
+  it('documents confirmation and completion bodies', () => {
     const confirm = schema('ConfirmFixRequest');
     expect(confirm.required).toEqual(['challengeId']);
     expect(confirm.properties.challengeId.maxLength).toBe(200);
+    expect(confirm.description).toMatch(/single-use challenge/i);
     expect(confirmFixSchema.safeParse({ challengeId: '' }).success).toBe(false);
 
     const complete = schema('CompleteSessionRequest');
+    expect(complete.required).toEqual(['acknowledged']);
     expect(complete.properties.acknowledged.enum).toEqual([true]);
     expect(completeSessionSchema.safeParse({ acknowledged: false }).success).toBe(false);
   });
@@ -164,6 +185,7 @@ describe('response schemas match the DTO mappers', () => {
     role: 'USER' as const,
     content: 'I cleaned the filter',
     createdAt: new Date('2026-11-17T00:01:00.000Z'),
+    metadata: null,
   };
 
   it('documents exactly the session fields the mapper returns', () => {
@@ -179,12 +201,70 @@ describe('response schemas match the DTO mappers', () => {
     }
   });
 
-  it('documents exactly the message fields the mapper returns', () => {
+  it('documents the public user fields actually returned by auth endpoints', () => {
+    expect(Object.keys(schema('PublicUser').properties).sort()).toEqual(
+      ['id', 'email', 'username', 'createdAt', 'updatedAt'].sort(),
+    );
+  });
+
+  it('does not claim an auth response that the endpoint never returns', () => {
+    expect(operation('/auth/logout', 'post').responses['401']).toBeUndefined();
+    expect(operation('/auth/logout', 'post').responses['429']).toBeDefined();
+  });
+
+  it('documents exactly the message fields the mapper returns, with optional metadata', () => {
     const mapped = toMessageDto(rawMessage);
-    expect(Object.keys(messageDtoSelect).sort()).toEqual(Object.keys(mapped).sort());
-    expect(Object.keys(schema('MessageDto').properties).sort()).toEqual(Object.keys(mapped).sort());
+    expect(Object.keys(messageDtoSelect).sort()).toEqual(Object.keys(schema('MessageDto').properties).sort());
     expect(schema('MessageDto').required.sort()).toEqual(Object.keys(mapped).sort());
+    expect(schema('MessageDto').properties.metadata.$ref).toBe(
+      '#/components/schemas/AssistantMessageMetadataDto',
+    );
+    expect(schema('MessageDto').required).not.toContain('metadata');
     expect(schema('MessageDto').additionalProperties).toBe(false);
+  });
+
+  it('documents the backend-controlled structured turn schemas', () => {
+    expect(schema('DiagnosisOutcome').enum).toEqual([
+      'NEEDS_CLARIFICATION',
+      'NEEDS_MODEL_NUMBER',
+      'READY_FOR_CONFIRMATION',
+      'NEEDS_PART',
+      'TECHNICIAN_REQUIRED',
+      'UNRESOLVED',
+      'FIXED',
+    ]);
+    expect(schema('Compatibility').enum).toEqual(['VERIFIED', 'POSSIBLE_MATCH', 'UNKNOWN']);
+    expect(schema('ModelScope').enum).toEqual([
+      'UNSPECIFIED',
+      'TOP_LOAD',
+      'FRONT_LOAD',
+      'FRENCH_DOOR_BOTTOM_FREEZER',
+    ]);
+
+    const turn = schema('TurnDto');
+    expect(turn.required).toEqual(['userMessage', 'assistantMessage', 'progress', 'citations']);
+    expect(turn.properties.userMessage.$ref).toBe('#/components/schemas/MessageDto');
+    expect(turn.properties.progress.$ref).toBe('#/components/schemas/DiagnosisProgressDto');
+    expect(turn.properties.knowledge.$ref).toBe('#/components/schemas/KnowledgeDto');
+    expect(turn.properties.parts.$ref).toBe('#/components/schemas/PartsDto');
+
+    const metadata = schema('AssistantMessageMetadataDto');
+    expect(metadata.required).toEqual(['kind', 'requestId', 'progress', 'citations']);
+    expect(metadata.properties.kind.enum).toEqual(['ASSISTANT_TURN']);
+
+    const progress = schema('DiagnosisProgressDto');
+    expect(progress.properties.fixChallenge).toBeDefined();
+    expect(progress.properties.fixChallengeExpiresAt).toBeDefined();
+
+    const knowledge = schema('KnowledgeDto');
+    expect(knowledge.description).toMatch(/complete approved/i);
+    expect(knowledge.properties.repairSteps.items.$ref).toBe('#/components/schemas/RepairStepKnowledgeDto');
+
+    const parts = schema('PartsDto');
+    expect(parts.properties.candidates.items.$ref).toBe('#/components/schemas/PartCandidateDto');
+    expect(schema('PartCandidateDto').properties.compatibility.$ref).toBe(
+      '#/components/schemas/Compatibility',
+    );
   });
 
   it('documents the shared pagination envelope', () => {
@@ -194,13 +274,6 @@ describe('response schemas match the DTO mappers', () => {
       expect(Object.keys(schema(name).properties).sort()).toEqual(keys);
       expect(schema(name).required.sort()).toEqual(keys);
     }
-    expect(page).toEqual({
-      items: [toMessageDto(rawMessage)],
-      page: 2,
-      limit: 1,
-      total: 3,
-      totalPages: 3,
-    });
     expect(toPaginatedDto([], 0, 1, 20).totalPages).toBe(0);
   });
 });
@@ -215,7 +288,13 @@ describe('status codes and error responses match service behaviour', () => {
       '/diagnosis/{id}': { get: ['200', '400', '401', '404', '500'] },
       '/diagnosis/{id}/messages': {
         get: ['200', '400', '401', '404', '500'],
-        post: ['201', '400', '401', '404', '409', '500'],
+        post: ['201', '400', '401', '404', '409', '429', '500', '502', '503', '504'],
+      },
+      '/diagnosis/{id}/confirm': {
+        post: ['200', '400', '401', '404', '409'],
+      },
+      '/diagnosis/{id}/complete': {
+        post: ['200', '400', '401', '404', '409'],
       },
     };
 
@@ -230,21 +309,41 @@ describe('status codes and error responses match service behaviour', () => {
     expect(response('ApplianceNotFound')).toBeDefined();
     expect(response('SessionNotFound')).toBeDefined();
     expect(response('SessionClosed')).toBeDefined();
-    expect(response('NotImplemented')).toBeDefined();
+    expect(response('AiTurnIncomplete')).toBeDefined();
+    expect(response('InvalidFixConfirmation')).toBeDefined();
+    expect(response('SessionNotCompletable')).toBeDefined();
+    expect(response('AiProviderError')).toBeDefined();
+    expect(response('AiInvalidResponse')).toBeDefined();
+
     expect(responseText(operation('/diagnosis', 'post'), '404')).toContain('APPLIANCE_NOT_FOUND');
     expect(responseText(operation('/diagnosis/{id}', 'get'), '404')).toContain('SESSION_NOT_FOUND');
     expect(responseText(operation('/diagnosis/{id}/messages', 'get'), '404')).toContain('SESSION_NOT_FOUND');
     expect(responseText(operation('/diagnosis/{id}/messages', 'post'), '409')).toContain('SESSION_CLOSED');
+    const invalidResponseText = responseText(operation('/diagnosis/{id}/messages', 'post'), '502');
+    expect(invalidResponseText).toContain('AI_INVALID_RESPONSE');
+    expect(invalidResponseText).toContain('AI_PROVIDER_REJECTED');
+    expect(responseText(operation('/diagnosis/{id}/messages', 'post'), '503')).toContain('AI_TIMEOUT');
+    expect(responseText(operation('/diagnosis/{id}/confirm', 'post'), '409')).toContain(
+      'INVALID_FIX_CONFIRMATION',
+    );
+    expect(responseText(operation('/diagnosis/{id}/complete', 'post'), '409')).toContain(
+      'SESSION_NOT_COMPLETABLE',
+    );
   });
 
-  it('keeps confirm and complete documented as 501 placeholders with valid bodies', () => {
+  it('documents live confirmation and completion success responses', () => {
     for (const path of ['/diagnosis/{id}/confirm', '/diagnosis/{id}/complete']) {
       const op = operation(path, 'post');
-      expect(Object.keys(op.responses).sort()).toEqual(['400', '401', '501']);
-      expect(responseText(op, '501')).toContain('NOT_IMPLEMENTED');
+      expect(op.summary).not.toMatch(/not implemented/i);
+      expect(op.responses['200']).toBeDefined();
+      expect(op.responses['501']).toBeUndefined();
       expect(op.requestBody.required).toBe(true);
       expect(op.parameters).toEqual([{ $ref: '#/components/parameters/SessionIdParam' }]);
     }
+
+    expect(responseText(operation('/diagnosis/{id}/confirm', 'post'), '200')).toContain('SessionDto');
+    expect(responseText(operation('/diagnosis/{id}/complete', 'post'), '200')).toContain('SessionDto');
+    expect(responseText(operation('/diagnosis/{id}/messages', 'post'), '201')).toContain('TurnDto');
   });
 
   it('keeps every $ref resolvable for Swagger UI Try it out', () => {

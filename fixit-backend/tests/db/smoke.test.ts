@@ -12,12 +12,12 @@ describe('fixit-test smoke checks (read-only)', () => {
     expect(rows[0]?.ok).toBe(true);
   });
 
-  it('has the four finished migrations', async () => {
+  it('has the five finished migrations', async () => {
     const rows = await prisma.$queryRaw<Array<{ count: number }>>`
       SELECT count(*)::int AS count FROM "_prisma_migrations"
       WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
-    expect(rows[0]?.count).toBe(4);
+    expect(rows[0]?.count).toBe(5);
   });
 
   it('has the expected Verdict enum', async () => {

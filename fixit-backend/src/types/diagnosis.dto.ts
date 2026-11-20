@@ -7,6 +7,14 @@
 // A DTO is an object that defines exactly what data we allow to send from our backend to the frontend or from one part of an application to another.
 
 import type { DiagnosisSession, Message } from '../generated/prisma/client.js';
+import {
+  parseAssistantMetadata,
+  type AssistantMessageMetadataDto,
+  type CitationDto,
+  type DiagnosisProgressDto,
+  type KnowledgeDto,
+  type PartsDto,
+} from '../validators/ai.validator.js';
 
 // Responses select only these columns. Unrelated fields are not even loaded
 // for a response query.
@@ -26,6 +34,7 @@ export const messageDtoSelect = {
   role: true,
   content: true,
   createdAt: true,
+  metadata: true,
 } as const;
 
 type SessionRecord = Pick<DiagnosisSession, keyof typeof sessionDtoSelect>;
@@ -47,6 +56,19 @@ export type MessageDto = {
   role: Message['role'];
   content: string;
   createdAt: Date;
+  metadata?: AssistantMessageMetadataDto;
+};
+
+// Immediate response for POST /diagnosis/:id/messages and for replay of an
+// already persisted turn. Structured data is never parsed from AI text.
+export type TurnDto = {
+  userMessage: MessageDto;
+  assistantMessage: MessageDto;
+  progress: DiagnosisProgressDto;
+  followUpQuestion?: string;
+  knowledge?: KnowledgeDto;
+  parts?: PartsDto;
+  citations?: CitationDto[];
 };
 
 export type PaginatedDto<T> = {
@@ -70,12 +92,14 @@ export function toSessionDto(session: SessionRecord): SessionDto {
 }
 
 export function toMessageDto(message: MessageRecord): MessageDto {
+  const metadata = parseAssistantMetadata(message.metadata);
   return {
     id: message.id,
     sessionId: message.sessionId,
     role: message.role,
     content: message.content,
     createdAt: message.createdAt,
+    ...(metadata ? { metadata } : {}),
   };
 }
 

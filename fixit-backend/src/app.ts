@@ -1,5 +1,6 @@
 
 import express from "express";
+import { env } from "./config/env.js";
 import { healthRouter } from "./routes/health.routes.js";
 import { authRouter } from "./routes/auth.routes.js";
 import { diagnosisRouter } from "./routes/diagnosis.routes.js";
@@ -21,9 +22,11 @@ app.use("/health", healthRouter);
 app.use("/auth", authRouter);
 app.use("/diagnosis", diagnosisRouter);
 
-// API documentation (Swagger UI + OpenAPI JSON). Mounted before notFound so /docs
-// resolves as a route, and kept additive/removable without touching API handlers.
-app.use("/docs", docsRouter);
+// API documentation is opt-in so Swagger UI and the raw spec are not public by
+// accident. Set ENABLE_API_DOCS=true for local/staging documentation.
+if (env.ENABLE_API_DOCS) {
+  app.use("/docs", docsRouter);
+}
 
 // Handle unknown routes
 app.use(notFound);

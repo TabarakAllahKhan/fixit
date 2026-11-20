@@ -3,9 +3,9 @@ import { describe, expect, it } from 'vitest';
 import { app } from '../../src/app.js';
 import { signAccessToken } from '../../src/services/token.service.js';
 
-// These tests exercise routing, auth, validation and the two remaining stubs
-// only. Implemented endpoints are covered against fixit-test in tests/db; no
-// valid request here is allowed to reach the database.
+// These tests exercise routing, auth and validation only. Provider-backed and
+// database-backed behaviour is covered by unit/DB tests; no valid request here
+// is allowed to reach the database.
 const userId = '00000000-0000-7000-8000-000000000000';
 const applianceId = '00000000-0000-7000-8000-000000000001';
 const authHeader = `Bearer ${signAccessToken(userId)}`;
@@ -89,8 +89,30 @@ describe('diagnosis route validation', () => {
     expect(response.body.error.code).toBe('VALIDATION_ERROR');
   });
 
+  it('rejects a message without a requestId', async () => {
+    const response = await authorized('post', `/diagnosis/${userId}/messages`).send({
+      content: 'I cleaned the filter',
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('rejects a malformed requestId', async () => {
+    const response = await authorized('post', `/diagnosis/${userId}/messages`).send({
+      requestId: 'not-a-uuid',
+      content: 'I cleaned the filter',
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
   it('rejects an empty message', async () => {
-    const response = await authorized('post', `/diagnosis/${userId}/messages`).send({ content: '   ' });
+    const response = await authorized('post', `/diagnosis/${userId}/messages`).send({
+      requestId: crypto.randomUUID(),
+      content: '   ',
+    });
 
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe('VALIDATION_ERROR');
@@ -117,7 +139,13 @@ describe('diagnosis requires authentication on every route', () => {
     { method: 'get', path: '/diagnosis?page=1&limit=20' },
     { method: 'get', path: `/diagnosis/${userId}` },
     { method: 'get', path: `/diagnosis/${userId}/messages?page=1&limit=20` },
-    { method: 'post', path: `/diagnosis/${userId}/messages`, body: { content: 'I cleaned the filter' } },
+    {
+      method: 'post',
+      path: `/diagnosis/${userId}/messages`,
+      body: { requestId: crypto.randomUUID(), content: 'I cleaned the filter' },
+    },
+    { method: 'post', path: `/diagnosis/${userId}/confirm`, body: { challengeId: 'server-issued' } },
+    { method: 'post', path: `/diagnosis/${userId}/complete`, body: { acknowledged: true } },
   ];
 
   it.each(protectedRoutes)('rejects unauthenticated $method $path', async ({ method, path, body }) => {
@@ -130,30 +158,7 @@ describe('diagnosis requires authentication on every route', () => {
   });
 });
 
-describe('diagnosis placeholders still returning 501', () => {
-  const emptyEnvelope = (code: string, message: string) => ({
-    success: false,
-    error: { code, message },
-  });
-
-  const validRoutes: Array<{ method: 'get' | 'post'; path: string; body?: object }> = [
-    { method: 'post', path: `/diagnosis/${userId}/confirm`, body: { challengeId: 'server-issued-challenge' } },
-    { method: 'post', path: `/diagnosis/${userId}/complete`, body: { acknowledged: true } },
-  ];
-
-  it.each(validRoutes)('returns an explicit 501 for $method $path', async ({ method, path, body }) => {
-    const call = authorized(method, path);
-    if (body) call.send(body);
-    const response = await call;
-
-    expect(response.status).toBe(501);
-    expect(response.body.success).toBe(false);
-    expect(response.body.error.code).toBe('NOT_IMPLEMENTED');
-    expect(typeof response.body.error.message).toBe('string');
-    expect(response.body.error.message.length).toBeGreaterThan(0);
-    expect(emptyEnvelope('NOT_IMPLEMENTED', response.body.error.message)).toEqual(response.body);
-  });
-
+describe('diagnosis route fallbacks', () => {
   it('returns 404 for an unknown nested diagnosis route', async () => {
     const response = await authorized('get', `/diagnosis/${userId}/not-a-route`);
 
@@ -165,8 +170,8 @@ describe('diagnosis placeholders still returning 501', () => {
   });
 });
 
-describe('minimal CORS', () => {
-  it('reflects the requesting origin on a normal response', async () => {
+describe('allowlisted CORS', () => {
+  it('reflects an allowed origin on a normal response', async () => {
     const response = await request(app).get('/diagnosis').set('Origin', 'http://localhost:19006');
 
     expect(response.status).toBe(401);
@@ -175,7 +180,7 @@ describe('minimal CORS', () => {
     expect(response.headers.vary).toBe('Origin');
   });
 
-  it('answers a preflight request without reaching authentication', async () => {
+  it('answers an allowed preflight request without reaching authentication', async () => {
     const response = await request(app)
       .options('/diagnosis')
       .set('Origin', 'http://localhost:19006')
@@ -184,5 +189,24 @@ describe('minimal CORS', () => {
     expect(response.status).toBe(204);
     expect(response.headers['access-control-allow-origin']).toBe('http://localhost:19006');
     expect(response.headers['access-control-allow-methods']).toContain('POST');
+  });
+
+  it('does not allow a non-allowlisted browser origin', async () => {
+    const response = await request(app)
+      .get('/diagnosis')
+      .set('Origin', 'https://evil.example');
+
+    expect(response.status).toBe(401);
+    expect(response.headers['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('rejects a preflight from a non-allowlisted origin', async () => {
+    const response = await request(app)
+      .options('/diagnosis')
+      .set('Origin', 'https://evil.example')
+      .set('Access-Control-Request-Method', 'POST');
+
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe('ORIGIN_NOT_ALLOWED');
   });
 });

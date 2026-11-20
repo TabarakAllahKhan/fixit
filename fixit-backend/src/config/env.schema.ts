@@ -2,10 +2,15 @@ import { z } from 'zod';
 
 // Environment variables are always text, so booleans are parsed from the exact
 // strings "true"/"false" instead of JavaScript truthiness (where "false" is true).
-const booleanFromEnv = z
-  .enum(['true', 'false'], { message: 'must be "true" or "false"' })
-  .default('false')
-  .transform((value) => value === 'true');
+function booleanFromEnvWithDefault(defaultValue: 'true' | 'false') {
+  return z
+    .enum(['true', 'false'], { message: 'must be "true" or "false"' })
+    .default(defaultValue)
+    .transform((value) => value === 'true');
+}
+
+const booleanFromEnv = booleanFromEnvWithDefault('false');
+const enabledByDefault = booleanFromEnvWithDefault('true');
 
 // An empty or whitespace-only value counts as absent, so `.env` placeholders
 // like `GROQ_API_KEY=` do not look like a configured credential.
@@ -24,6 +29,19 @@ export const envSchema = z
     // Optional to supply; defaults to 3000 when absent. Values that are supplied
     // are still validated so an invalid port cannot reach the server.
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+    // Comma-separated browser origins. Native clients normally send no Origin
+    // header and remain allowed; browser origins must be explicitly listed.
+    CORS_ALLOWED_ORIGINS: z
+      .string()
+      .trim()
+      .default('http://localhost:19006,http://localhost:8081,exp://localhost:19000'),
+    // Docs are opt-in so Swagger UI is not public by accident.
+    ENABLE_API_DOCS: booleanFromEnv,
+    HEALTH_CHECK_TIMEOUT_MS: z.coerce.number().int().min(500).max(30_000).default(3_000),
+    RATE_LIMIT_ENABLED: enabledByDefault,
+    RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1_000).max(3_600_000).default(60_000),
+    RATE_LIMIT_AUTH_MAX: z.coerce.number().int().min(1).max(1_000).default(30),
+    RATE_LIMIT_MESSAGE_MAX: z.coerce.number().int().min(1).max(1_000).default(60),
     DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
     // Signing key for short-lived access tokens. Use a random value of at least
     // 32 characters; changing it invalidates every issued access token.
@@ -33,7 +51,26 @@ export const envSchema = z
     // Backend-only AI credential. Optional for development/test, required in
     // production (enforced below). Never log this value.
     GROQ_API_KEY: optionalTrimmedString,
-    GROQ_MODEL: z.string().trim().min(1).default('openai/gpt-oss-120b'),
+    // Cost-conscious default. 120b remains available for manual comparison.
+    GROQ_MODEL: z.string().trim().min(1).default('openai/gpt-oss-20b'),
+    GROQ_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(15_000),
+    GROQ_MAX_RETRIES: z.coerce.number().int().min(0).max(2).default(1),
+    GROQ_MAX_TOOL_ROUNDS: z.coerce.number().int().min(1).max(5).default(2),
+    GROQ_MAX_TOOL_CALLS: z.coerce.number().int().min(1).max(10).default(3),
+    GROQ_HISTORY_LIMIT: z.coerce.number().int().min(1).max(50).default(12),
+    GROQ_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(256).max(8_192).default(1_200),
+    GROQ_REASONING_EFFORT: z.enum(['none', 'default', 'low', 'medium', 'high']).default('low'),
+    FIX_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(600),
+    // Disabled by default. Enable only for controlled browser-search testing.
+    PARTS_PROVIDER: z.enum(['none', 'groq_browser']).default('none'),
+    PARTS_ALLOWED_DOMAINS: z
+      .string()
+      .trim()
+      .min(1)
+      .default(
+        'samsung.com,lg.com,whirlpool.com,bosch-home.com,bosch.com,haier.com,partselect.com,repairclinic.com,appliancepartspros.com,searspartsdirect.com',
+      ),
+    PARTS_MAX_RESULTS: z.coerce.number().int().min(1).max(10).default(5),
     // Development-only access to UNREVIEWED knowledge. Rejected in production.
     ALLOW_UNREVIEWED_KNOWLEDGE: booleanFromEnv,
   })
@@ -53,6 +90,14 @@ export const envSchema = z
         code: 'custom',
         path: ['ALLOW_UNREVIEWED_KNOWLEDGE'],
         message: 'ALLOW_UNREVIEWED_KNOWLEDGE cannot be enabled in production',
+      });
+    }
+
+    if (!value.RATE_LIMIT_ENABLED) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['RATE_LIMIT_ENABLED'],
+        message: 'RATE_LIMIT_ENABLED cannot be disabled in production',
       });
     }
   });

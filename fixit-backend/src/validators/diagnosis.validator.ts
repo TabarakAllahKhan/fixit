@@ -33,6 +33,9 @@ export const listSessionsQuerySchema = z.object(paginationSchema);
 export const listMessagesQuerySchema = z.object(paginationSchema);
 
 export const sendMessageSchema = z.object({
+  // Client-generated idempotency key. Replaying the same key returns the
+  // stored AI turn instead of calling Groq or inserting another message pair.
+  requestId: z.uuid('Request ID must be a valid UUID'),
   content: z.string().trim().min(1, 'Message cannot be empty').max(4000, 'Message is too long'),
 });
 

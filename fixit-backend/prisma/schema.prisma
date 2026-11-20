@@ -176,6 +176,10 @@ model DiagnosisSession {
   fixConfirmationIssuedAt    DateTime?
   fixConfirmationExpiresAt   DateTime?
 
+  // Server-validated diagnostic facts that must survive across turns.
+  // Application code validates the JSON shape on every read/write.
+  context Json?
+
   messages Message[]
 
   createdAt DateTime @default(now())
@@ -201,5 +205,14 @@ model Message {
   content   String
   createdAt DateTime    @default(now())
 
+  // Client-supplied idempotency key for one AI turn. One USER and one
+  // ASSISTANT row may share a requestId; duplicates are rejected by the DB.
+  clientRequestId String? @db.Uuid
+
+  // Client-safe structured payload for assistant messages (AI outcome,
+  // knowledge, citations, parts). Validated by application code.
+  metadata Json?
+
+  @@unique([sessionId, clientRequestId, role])
   @@index([sessionId])
 }
