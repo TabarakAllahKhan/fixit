@@ -24,6 +24,7 @@ const originalMaxResults = env.PARTS_MAX_RESULTS;
 const query = {
   brand: 'LG',
   modelNumber: 'WT-H7550',
+  modelSource: 'APPLIANCE' as const,
   component: 'drain pump',
   partNumber: 'AP123456',
 };
@@ -44,9 +45,14 @@ afterEach(() => {
 describe('buildPartsQuery', () => {
   it('includes exact brand/model/component and optional part number only', () => {
     expect(buildPartsQuery(query)).toBe('LG WT-H7550 drain pump replacement part part AP123456');
-    expect(buildPartsQuery({ brand: 'LG', modelNumber: 'WT-H7550', component: 'filter' })).toBe(
-      'LG WT-H7550 filter replacement part',
-    );
+    expect(
+      buildPartsQuery({
+        brand: 'LG',
+        modelNumber: 'WT-H7550',
+        modelSource: 'USER_MESSAGE',
+        component: 'filter',
+      }),
+    ).toBe('LG WT-H7550 filter replacement part');
   });
 });
 
@@ -75,6 +81,16 @@ describe('classifyCompatibility', () => {
         trustedSource: true,
       }),
     ).toBe('VERIFIED');
+  });
+
+  it('never classifies VERIFIED without trusted model provenance', () => {
+    expect(
+      classifyCompatibility({
+        query: { ...query, modelSource: undefined as unknown as 'APPLIANCE' },
+        sourceText: 'Fits WT-H7550 drain pump, part AP123456',
+        trustedSource: true,
+      }),
+    ).toBe('POSSIBLE_MATCH');
   });
 
   it('never upgrades model-only or untrusted evidence to VERIFIED', () => {
@@ -207,9 +223,28 @@ describe('searchReplacementParts', () => {
   it('requires exact model information before enabling search', async () => {
     env.PARTS_PROVIDER = 'groq_browser';
 
-    const result = await searchReplacementParts({ brand: 'LG', modelNumber: '', component: 'pump' });
+    const result = await searchReplacementParts({
+      brand: 'LG',
+      modelNumber: '',
+      modelSource: 'APPLIANCE',
+      component: 'pump',
+    });
 
     expect(result.note).toMatch(/exact brand, model number and component/i);
+    expect(result.candidates).toEqual([]);
+    expect(createChatCompletionMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses model-specific provider calls without trusted model provenance', async () => {
+    env.PARTS_PROVIDER = 'groq_browser';
+
+    const result = await searchReplacementParts({
+      brand: 'LG',
+      modelNumber: 'WT-H7550',
+      component: 'drain pump',
+    } as Parameters<typeof searchReplacementParts>[0]);
+
+    expect(result.note).toMatch(/trusted appliance model/i);
     expect(result.candidates).toEqual([]);
     expect(createChatCompletionMock).not.toHaveBeenCalled();
   });

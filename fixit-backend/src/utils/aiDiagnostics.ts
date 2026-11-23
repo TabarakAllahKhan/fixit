@@ -17,7 +17,7 @@ function redactKnownSecrets(value: string): string {
 
   // Exact configured values first. Empty/short placeholders are ignored so a
   // generic word like "test" cannot redact unrelated diagnostic text.
-  const secrets = [env.GROQ_API_KEY, env.DATABASE_URL].filter(
+  const secrets = [env.GOOGLE_API_KEY, env.GROQ_API_KEY, env.DATABASE_URL].filter(
     (secret): secret is string => typeof secret === 'string' && secret.length >= 8,
   );
   for (const secret of secrets) {
@@ -98,7 +98,13 @@ export type ProviderFailureDetails = {
 function safeToolChoice(value: unknown): string | undefined {
   if (typeof value === 'string') return safeToken(value);
   const choice = asRecord(value);
-  const name = asRecord(choice?.function)?.name;
+  if (!choice) return undefined;
+  const mode = choice.mode;
+  if (mode === 'any') return 'any';
+  if (mode === 'specific') {
+    return `function:${typeof choice.name === 'string' ? (safeToken(choice.name) ?? 'unknown') : 'unknown'}`;
+  }
+  const name = asRecord(choice.function)?.name;
   return typeof name === 'string' ? `function:${safeToken(name) ?? 'unknown'}` : undefined;
 }
 
@@ -134,6 +140,40 @@ export function logGroqProviderFailure({ model, error, round, toolChoice }: Prov
     providerErrorCode: safeToken(body?.code ?? record?.code),
     providerErrorMessage: safeMessage(rawMessage),
     providerFailedGeneration: safeMessage(rawFailedGeneration),
+    providerRequestId: safeToken(rawRequestId),
+  });
+}
+
+// Gemini provider failures use the same allowlist/redaction rules as the legacy
+// Groq logger. No conversation content, tool arguments, response bodies or
+// credentials are emitted.
+export function logGeminiProviderFailure({
+  model,
+  error,
+  round,
+  toolChoice,
+}: ProviderFailureDetails): void {
+  const record = asRecord(error);
+  const body = asRecord(record?.error);
+  const status = record?.status ?? (typeof record?.code === 'number' ? record.code : undefined);
+  const rawMessage = error instanceof Error ? error.message : record?.message;
+  const rawRequestId =
+    headerValue(record?.headers, 'x-request-id') ??
+    headerValue(record?.headers, 'x-goog-request-id') ??
+    body?.request_id ??
+    body?.requestId ??
+    record?.request_id ??
+    record?.requestId;
+
+  emit('error', 'gemini.provider_failure', {
+    model: safeToken(model, 'unknown'),
+    errorClass: safeToken(classNameOf(error), 'unknown'),
+    errorName: safeToken(record?.name),
+    status: typeof status === 'number' && Number.isFinite(status) ? status : undefined,
+    round: typeof round === 'number' && Number.isFinite(round) ? round : undefined,
+    toolChoice: safeToolChoice(toolChoice),
+    providerErrorCode: safeToken(body?.code ?? record?.code),
+    providerErrorMessage: safeMessage(rawMessage),
     providerRequestId: safeToken(rawRequestId),
   });
 }

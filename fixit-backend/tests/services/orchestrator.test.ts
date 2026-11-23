@@ -1,19 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../../src/config/env.js';
+import { resolveTrustedApplianceIdentity } from '../../src/services/ai/appliance-identity.js';
 import { ForcedToolNotCalledError } from '../../src/utils/aiErrors.js';
 import { HttpError } from '../../src/utils/httpError.js';
 import { emptyDiagnosisContext, type KnowledgeDto, type PartsDto } from '../../src/validators/ai.validator.js';
 
-const { createChatCompletionMock, searchErrorCodesMock, getRepairStepsMock } = vi.hoisted(() => ({
-  createChatCompletionMock: vi.fn(),
+const { createInteractionMock, searchErrorCodesMock, getRepairStepsMock } = vi.hoisted(() => ({
+  createInteractionMock: vi.fn(),
   searchErrorCodesMock: vi.fn(),
   getRepairStepsMock: vi.fn(),
 }));
 let logSpy: ReturnType<typeof vi.spyOn>;
 const capturedLogs: string[] = [];
 
-vi.mock('../../src/services/groq.service.js', () => ({
-  createChatCompletion: createChatCompletionMock,
+vi.mock('../../src/services/ai/provider.js', () => ({
+  createAiInteraction: createInteractionMock,
 }));
 
 vi.mock('../../src/services/knowledge.service.js', async (importOriginal) => {
@@ -27,27 +28,18 @@ vi.mock('../../src/services/knowledge.service.js', async (importOriginal) => {
 
 import { runDiagnosisTurn, type OrchestratorInput } from '../../src/services/ai/orchestrator.js';
 
+function functionCall(name: string, args: unknown, id = 'call-1') {
+  const step = { type: 'function_call', id, name, arguments: args };
+  return { id, name, arguments: args, step };
+}
+
 function completion(name: string, args: unknown, id = 'call-1', finishReason?: string) {
+  const call = functionCall(name, args, id);
   return {
-    choices: [
-      {
-        finish_reason: finishReason,
-        message: {
-          role: 'assistant',
-          content: null,
-          tool_calls: [
-            {
-              id,
-              type: 'function',
-              function: {
-                name,
-                arguments: typeof args === 'string' ? args : JSON.stringify(args),
-              },
-            },
-          ],
-        },
-      },
-    ],
+    calls: [call],
+    steps: [call.step],
+    text: '',
+    ...(finishReason ? { finishReason } : {}),
   };
 }
 
@@ -67,9 +59,18 @@ const partsResult: PartsDto = {
   ],
 };
 
+function identity(overrides: Partial<Parameters<typeof resolveTrustedApplianceIdentity>[0]> = {}) {
+  return resolveTrustedApplianceIdentity({
+    appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: null },
+    userMessages: [],
+    currentUserContent: '',
+    ...overrides,
+  });
+}
+
 function input(overrides: Partial<OrchestratorInput> = {}): OrchestratorInput {
   return {
-    appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: null },
+    identity: identity(),
     context: emptyDiagnosisContext(),
     history: [],
     userContent: 'My washer is not draining',
@@ -134,7 +135,7 @@ beforeEach(() => {
       if (typeof arg === 'string') capturedLogs.push(arg);
     }
   });
-  createChatCompletionMock.mockReset();
+  createInteractionMock.mockReset();
   searchErrorCodesMock.mockReset().mockResolvedValue(emptyKnowledge);
   getRepairStepsMock.mockReset().mockResolvedValue({
     eligible: false,
@@ -157,7 +158,7 @@ async function expectAiInvalidResponse(promise: Promise<unknown>, message: RegEx
 
 describe('runDiagnosisTurn policy', () => {
   it('returns the structured advisory outcome without setting a verdict', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', {
         reply: 'Can you tell me whether it is top-load or front-load?',
         outcome: 'NEEDS_CLARIFICATION',
@@ -177,7 +178,7 @@ describe('runDiagnosisTurn policy', () => {
   });
 
   it('handles strict-mode null optionals without weakening the technician escalation', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion(
         'submit_diagnosis_outcome',
         {
@@ -204,7 +205,7 @@ describe('runDiagnosisTurn policy', () => {
   });
 
   it('handles strict-mode null optionals for a valid non-hazard outcome', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion(
         'submit_diagnosis_outcome',
         {
@@ -230,12 +231,18 @@ describe('runDiagnosisTurn policy', () => {
     });
     expect(result.nextContext.suspectedComponents).toEqual([]);
     expect(result.nextContext.diagnosticFacts).toEqual([]);
-    expect(result.nextContext.confirmedModelNumber).toBeUndefined();
+    expect(result.nextContext.trustedApplianceIdentity).toMatchObject({
+      version: 1,
+      modelNumber: null,
+      modelSource: null,
+    });
   });
 
   it('ignores null part fields when recording the parts query', async () => {
-    const appliance = { category: 'WASHING_MACHINE' as const, brand: 'TestBrand', modelNumber: 'MODEL-1' };
-    createChatCompletionMock.mockResolvedValueOnce(
+    const trustedIdentity = identity({
+      appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
+    });
+    createInteractionMock.mockResolvedValueOnce(
       completion(
         'submit_diagnosis_outcome',
         {
@@ -252,14 +259,14 @@ describe('runDiagnosisTurn policy', () => {
       ),
     );
 
-    const result = await runDiagnosisTurn(input({ appliance }));
+    const result = await runDiagnosisTurn(input({ identity: trustedIdentity }));
 
     expect(result.progress.outcome).toBe('NEEDS_PART');
     expect(result.nextContext.lastPartsQuery).toBeUndefined();
   });
 
   it('escalates hazard language to a technician even when the AI asks to confirm a fix', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', {
         reply: 'Check the mains voltage and live wires before continuing.',
         outcome: 'READY_FOR_CONFIRMATION',
@@ -276,7 +283,7 @@ describe('runDiagnosisTurn policy', () => {
   });
 
   it('never accepts an AI FIXED claim without an approved repair sequence', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', { reply: 'It is fixed.', outcome: 'FIXED' }),
     );
 
@@ -289,7 +296,7 @@ describe('runDiagnosisTurn policy', () => {
 
   it('converts READY_FOR_CONFIRMATION into a backend-issued challenge only with approved steps', async () => {
     getRepairStepsMock.mockResolvedValueOnce(approvedSequence());
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('get_repair_steps', { errorCode: 'FE' }, 'call-1'))
       .mockResolvedValueOnce(
         completion('submit_diagnosis_outcome', { reply: 'Follow the steps.', outcome: 'READY_FOR_CONFIRMATION' }, 'call-2'),
@@ -314,7 +321,7 @@ describe('runDiagnosisTurn policy', () => {
   });
 
   it('asks for the exact model before allowing a parts outcome', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', {
         reply: 'You will need a replacement pump.',
         outcome: 'NEEDS_PART',
@@ -331,18 +338,27 @@ describe('runDiagnosisTurn policy', () => {
 
   it('keeps backend parts classification and citations, never AI compatibility', async () => {
     const partsSearch = vi.fn().mockResolvedValue(partsResult);
-    const appliance = { category: 'WASHING_MACHINE' as const, brand: 'TestBrand', modelNumber: 'MODEL-1' };
-    createChatCompletionMock
-      .mockResolvedValueOnce(completion('find_replacement_parts', { component: 'drain pump' }, 'call-1'))
+    const trustedIdentity = identity({
+      appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
+    });
+    createInteractionMock
+      .mockResolvedValueOnce(
+        completion(
+          'find_replacement_parts',
+          { component: 'drain pump', modelNumber: 'AI-INVENTED' },
+          'call-1',
+        ),
+      )
       .mockResolvedValueOnce(
         completion('submit_diagnosis_outcome', { reply: 'Here are part listings.', outcome: 'NEEDS_PART' }, 'call-2'),
       );
 
-    const result = await runDiagnosisTurn(input({ appliance, partsSearch }));
+    const result = await runDiagnosisTurn(input({ identity: trustedIdentity, partsSearch }));
 
     expect(partsSearch).toHaveBeenCalledWith({
       brand: 'TestBrand',
       modelNumber: 'MODEL-1',
+      modelSource: 'APPLIANCE',
       component: 'drain pump',
     });
     expect(result.parts).toEqual(partsResult);
@@ -354,7 +370,7 @@ describe('runDiagnosisTurn policy', () => {
 
   it('does not call parts search when the exact model is missing', async () => {
     const partsSearch = vi.fn();
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('find_replacement_parts', { component: 'drain pump' }, 'call-1'))
       .mockResolvedValueOnce(
         completion(
@@ -371,26 +387,136 @@ describe('runDiagnosisTurn policy', () => {
     expect(result.parts?.candidates).toEqual([]);
   });
 
+  it('never lets AI facts, assistant claims or final modelNumber arguments establish identity', async () => {
+    const partsSearch = vi.fn();
+    createInteractionMock.mockResolvedValueOnce(
+      completion(
+        'submit_diagnosis_outcome',
+        {
+          reply: 'A pump is needed.',
+          outcome: 'NEEDS_PART',
+          component: 'drain pump',
+          modelNumber: 'AI-INVENTED-456',
+          diagnosticFacts: ['The model is AI-FACT-123 and it is a top-load washer'],
+        },
+        'call-ai-identity',
+      ),
+    );
+
+    const result = await runDiagnosisTurn(
+      input({
+        history: [
+          {
+            id: '00000000-0000-4000-8000-0000000000aa',
+            sessionId: '00000000-0000-4000-8000-0000000000f1',
+            role: 'ASSISTANT',
+            content: 'You told me the model was ASSISTANT-123 and top-load.',
+            createdAt: new Date(),
+          },
+        ],
+        partsSearch,
+      }),
+    );
+
+    expect(partsSearch).not.toHaveBeenCalled();
+    expect(result.progress.outcome).toBe('NEEDS_MODEL_NUMBER');
+    expect(result.nextContext.trustedApplianceIdentity).toMatchObject({
+      version: 1,
+      modelNumber: null,
+      modelSource: null,
+      modelScope: null,
+      scopeSource: null,
+    });
+    // Diagnostic facts remain available for normal diagnosis, but none of the
+    // AI/assistant model strings may enter the persisted trusted identity. The
+    // stripped modelNumber argument must not enter any persisted context.
+    expect(result.nextContext.diagnosticFacts).toContain(
+      'The model is AI-FACT-123 and it is a top-load washer',
+    );
+    const persistedIdentity = JSON.stringify(result.nextContext.trustedApplianceIdentity);
+    expect(persistedIdentity).not.toContain('AI-INVENTED-456');
+    expect(persistedIdentity).not.toContain('AI-FACT-123');
+    expect(persistedIdentity).not.toContain('ASSISTANT-123');
+    expect(JSON.stringify(result.nextContext)).not.toContain('AI-INVENTED-456');
+  });
+
+  it('does not infer configuration scope from a trusted model number', async () => {
+    const trustedIdentity = identity({
+      appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
+      currentUserContent: 'MODEL-1 shows FE',
+    });
+    searchErrorCodesMock.mockResolvedValue(knowledgeWithCodes({ code: 'FE' }));
+    createInteractionMock
+      .mockResolvedValueOnce(completion('get_repair_steps', { errorCode: 'FE' }, 'call-repair'))
+      .mockResolvedValueOnce(
+        completion('submit_diagnosis_outcome', { reply: 'No eligible steps.', outcome: 'UNRESOLVED' }, 'call-final'),
+      );
+
+    await runDiagnosisTurn(input({ identity: trustedIdentity }));
+
+    expect(searchErrorCodesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ category: 'WASHING_MACHINE', brand: 'TestBrand', modelScope: undefined }),
+      expect.anything(),
+      false,
+    );
+    expect(getRepairStepsMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ modelScope: undefined }),
+      false,
+    );
+  });
+
+  it('asks for clarification instead of selecting among conflicting user models', async () => {
+    const partsSearch = vi.fn();
+    const conflictedIdentity = identity({
+      userMessages: ['Model WW80T3040AA'],
+      currentUserContent: 'No, it is WW80T3040BB',
+    });
+    createInteractionMock
+      .mockResolvedValueOnce(completion('find_replacement_parts', { component: 'drain pump' }, 'call-1'))
+      .mockResolvedValueOnce(
+        completion(
+          'submit_diagnosis_outcome',
+          { reply: 'I need a part.', outcome: 'NEEDS_PART', component: 'drain pump' },
+          'call-2',
+        ),
+      );
+
+    const result = await runDiagnosisTurn(input({ identity: conflictedIdentity, partsSearch }));
+
+    expect(partsSearch).not.toHaveBeenCalled();
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
+    expect(result.progress.followUpQuestion).toMatch(/conflicting model numbers/i);
+    expect(result.parts?.note).toMatch(/conflicting model numbers/i);
+    expect(result.nextContext.trustedApplianceIdentity).toMatchObject({
+      version: 1,
+      modelNumber: null,
+      modelConflict: true,
+    });
+  });
+
   it('degrades safely when the parts provider fails', async () => {
-    const appliance = { category: 'WASHING_MACHINE' as const, brand: 'TestBrand', modelNumber: 'MODEL-1' };
+    const trustedIdentity = identity({
+      appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
+    });
     const partsSearch = vi.fn().mockRejectedValue(new HttpError(503, 'AI_RATE_LIMITED', 'rate limited'));
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('find_replacement_parts', { component: 'drain pump' }, 'call-1'))
       .mockResolvedValueOnce(
         completion('submit_diagnosis_outcome', { reply: 'A pump may be needed.', outcome: 'NEEDS_PART' }, 'call-2'),
       );
 
-    const result = await runDiagnosisTurn(input({ appliance, partsSearch }));
+    const result = await runDiagnosisTurn(input({ identity: trustedIdentity, partsSearch }));
 
     expect(result.parts).toMatchObject({ candidates: [] });
     expect(result.parts?.note).toMatch(/currently unavailable/i);
     expect(result.progress.verdict).toBe('NEEDS_PART');
   });
 
-  it('sends bounded history and cost-controlled provider options', async () => {
-    const snapshots: Array<{ messages: unknown[]; [key: string]: unknown }> = [];
-    createChatCompletionMock.mockImplementation(async (params: { messages: unknown[] }) => {
-      snapshots.push({ ...params, messages: [...params.messages] });
+  it('sends bounded stateless history and a forced tool choice', async () => {
+    const snapshots: Array<{ steps: unknown[]; [key: string]: unknown }> = [];
+    createInteractionMock.mockImplementation(async (params: { steps: unknown[] }) => {
+      snapshots.push({ ...params, steps: [...params.steps] });
       return completion('submit_diagnosis_outcome', { reply: 'Understood.', outcome: 'NEEDS_CLARIFICATION' });
     });
     const history = Array.from({ length: 20 }, (_, index) => ({
@@ -404,20 +530,26 @@ describe('runDiagnosisTurn policy', () => {
     await runDiagnosisTurn(input({ history }));
 
     const params = snapshots[0]!;
-    expect(params.model).toBe(env.GROQ_MODEL);
-    expect(params.tool_choice).toBe('required');
-    expect(params.reasoning_effort).toBe('low');
-    expect(params.max_completion_tokens).toBe(env.GROQ_MAX_COMPLETION_TOKENS);
+    // Model, timeout and token limits are central provider config, not request
+    // fields the orchestrator can weaken or switch per turn.
+    expect(params).not.toHaveProperty('model');
+    expect(params.toolChoice).toEqual({ mode: 'any' });
     expect(params.tools).toHaveLength(4);
-    expect(params.messages.length).toBeLessThanOrEqual(2 + env.GROQ_HISTORY_LIMIT + 2);
-    const systemMessage = params.messages[0] as { content?: string };
-    expect(systemMessage.content).toMatch(/technician/i);
+    expect(params.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'function', name: 'get_repair_steps' })]),
+    );
+    // Bounded prior turns plus the current user turn. Knowledge and identity
+    // are in the system instruction, which keeps the historic role mapping.
+    expect(params.steps.length).toBeLessThanOrEqual(1 + env.GEMINI_HISTORY_LIMIT);
+    expect(params.steps.every((step) => typeof (step as { type?: unknown }).type === 'string')).toBe(true);
+    expect(String(params.systemInstruction)).toMatch(/technician/i);
+    expect(String(params.systemInstruction)).toMatch(/Trusted appliance identity/i);
   });
 });
 
 describe('get_repair_steps backend code resolution', () => {
   async function runRepairStepsCall(errorCode: string, knowledge: KnowledgeDto) {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('get_repair_steps', { errorCode }, 'call-repair'))
       .mockResolvedValueOnce(
         completion(
@@ -566,7 +698,7 @@ describe('get_repair_steps backend code resolution', () => {
 
 describe('runDiagnosisTurn tool-loop safety', () => {
   it('forces the structured outcome after a lookup instead of allowing chained lookups', async () => {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-1'))
       .mockResolvedValueOnce(
         completion(
@@ -578,42 +710,42 @@ describe('runDiagnosisTurn tool-loop safety', () => {
 
     await runDiagnosisTurn(input());
 
-    expect(createChatCompletionMock).toHaveBeenCalledTimes(2);
-    expect(createChatCompletionMock.mock.calls[1]?.[0].tool_choice).toEqual({
-      type: 'function',
-      function: { name: 'submit_diagnosis_outcome' },
+    expect(createInteractionMock).toHaveBeenCalledTimes(2);
+    expect(createInteractionMock.mock.calls[1]?.[0].toolChoice).toEqual({
+      mode: 'specific',
+      name: 'submit_diagnosis_outcome',
     });
   });
 
   it('rejects unknown tools', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(completion('delete_everything', {}));
+    createInteractionMock.mockResolvedValueOnce(completion('delete_everything', {}));
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /unknown tool/i);
   });
 
   it('rejects duplicate tool calls', async () => {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-1'))
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-2'));
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /repeated a tool call/i);
   });
 
   it('stops at the tool-loop limit without a final outcome', async () => {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-1'))
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['E1'] }, 'call-2'));
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /tool-loop limit/i);
   });
 
   it('rejects invalid JSON and invalid tool arguments', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(completion('submit_diagnosis_outcome', '{bad json'));
+    createInteractionMock.mockResolvedValueOnce(completion('submit_diagnosis_outcome', '{bad json'));
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /invalid tool arguments/i);
 
-    createChatCompletionMock.mockResolvedValueOnce(completion('submit_diagnosis_outcome', {}));
+    createInteractionMock.mockResolvedValueOnce(completion('submit_diagnosis_outcome', {}));
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /failed validation/i);
   });
 
   it('rejects a 37-character repair code with a controlled validation failure', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('get_repair_steps', { errorCode: 'X'.repeat(37) }, 'call-overlong'),
     );
 
@@ -624,7 +756,7 @@ describe('runDiagnosisTurn tool-loop safety', () => {
   });
 
   it('rejects an outcome call that omits reply even when other fields are present', async () => {
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', {
         outcome: 'UNRESOLVED',
         followUpQuestion: null,
@@ -635,18 +767,22 @@ describe('runDiagnosisTurn tool-loop safety', () => {
   });
 
   it('rejects parallel tool calls and empty responses', async () => {
-    createChatCompletionMock.mockResolvedValueOnce({
-      choices: [{ message: { tool_calls: [{ id: 'a' }, { id: 'b' }] } }],
+    createInteractionMock.mockResolvedValueOnce({
+      calls: [
+        functionCall('search_error_codes', { codes: ['FE'] }, 'a'),
+        functionCall('search_error_codes', { codes: ['E1'] }, 'b'),
+      ],
+      text: '',
     });
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /parallel tool calls/i);
 
-    createChatCompletionMock.mockResolvedValueOnce({ choices: [{ message: { tool_calls: [] } }] });
+    createInteractionMock.mockResolvedValueOnce({ calls: [], text: '' });
     await expectAiInvalidResponse(runDiagnosisTurn(input()), /structured outcome/i);
   });
 
   it('logs tool validation diagnostics with issue paths and no argument values', async () => {
     const secret = 'user-secret-please-do-not-log';
-    createChatCompletionMock.mockResolvedValueOnce(
+    createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', { reply: secret, outcome: 'NOT_AN_OUTCOME' }, 'call-sensitive', 'tool_calls'),
     );
 
@@ -668,7 +804,7 @@ describe('runDiagnosisTurn tool-loop safety', () => {
   });
 
   it('labels provider calls with the round and effective tool choice for diagnostics', async () => {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-search'))
       .mockResolvedValueOnce(
         completion(
@@ -680,19 +816,19 @@ describe('runDiagnosisTurn tool-loop safety', () => {
 
     await runDiagnosisTurn(input());
 
-    expect(createChatCompletionMock).toHaveBeenCalledTimes(2);
-    expect(createChatCompletionMock.mock.calls[0]?.[1]).toEqual({
+    expect(createInteractionMock).toHaveBeenCalledTimes(2);
+    expect(createInteractionMock.mock.calls[0]?.[1]).toEqual({
       round: 0,
-      toolChoice: 'required',
+      toolChoice: { mode: 'any' },
     });
-    expect(createChatCompletionMock.mock.calls[1]?.[1]).toEqual({
+    expect(createInteractionMock.mock.calls[1]?.[1]).toEqual({
       round: 1,
-      toolChoice: { type: 'function', function: { name: 'submit_diagnosis_outcome' } },
+      toolChoice: { mode: 'specific', name: 'submit_diagnosis_outcome' },
     });
   });
 
   it('uses a safe deterministic turn when the forced final tool call is missing', async () => {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-search'))
       .mockRejectedValueOnce(new ForcedToolNotCalledError());
 
@@ -713,7 +849,7 @@ describe('runDiagnosisTurn tool-loop safety', () => {
   });
 
   it('keeps hazard escalation when the forced final tool call is missing', async () => {
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-search'))
       .mockRejectedValueOnce(new ForcedToolNotCalledError());
 
@@ -731,7 +867,7 @@ describe('runDiagnosisTurn tool-loop safety', () => {
   it('does not expose an eligible repair sequence through the fallback', async () => {
     searchErrorCodesMock.mockResolvedValue(knowledgeWithCodes({ code: 'FE' }));
     getRepairStepsMock.mockResolvedValueOnce(approvedSequence());
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(completion('get_repair_steps', { errorCode: 'FE' }, 'call-repair'))
       .mockRejectedValueOnce(new ForcedToolNotCalledError());
 
@@ -744,11 +880,368 @@ describe('runDiagnosisTurn tool-loop safety', () => {
   });
 
   it('does not use the fallback when the missing tool call is outside the forced final round', async () => {
-    createChatCompletionMock.mockRejectedValueOnce(new ForcedToolNotCalledError());
+    createInteractionMock.mockRejectedValueOnce(new ForcedToolNotCalledError());
 
     await expect(runDiagnosisTurn(input())).rejects.toMatchObject({
       statusCode: 502,
       code: 'AI_PROVIDER_REJECTED',
     });
+  });
+
+  it('propagates a provider tool-validation rejection without inventing an outcome', async () => {
+    createInteractionMock
+      .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-search'))
+      .mockRejectedValueOnce(
+        new HttpError(502, 'AI_PROVIDER_REJECTED', 'AI provider rejected the request'),
+      );
+
+    await expect(runDiagnosisTurn(input())).rejects.toMatchObject({
+      statusCode: 502,
+      code: 'AI_PROVIDER_REJECTED',
+    });
+
+    expect(toolFailureLogs()).toEqual([]);
+  });
+});
+
+describe('Gemini multi-turn tool history', () => {
+  it('replays the function call and backend result before the forced final turn', async () => {
+    createInteractionMock
+      .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-search'))
+      .mockResolvedValueOnce(
+        completion(
+          'submit_diagnosis_outcome',
+          { reply: 'The drain filter may be blocked.', outcome: 'NEEDS_CLARIFICATION' },
+          'call-final',
+        ),
+      );
+
+    await runDiagnosisTurn(input());
+
+    expect(createInteractionMock).toHaveBeenCalledTimes(2);
+    const secondRequest = createInteractionMock.mock.calls[1]?.[0] as {
+      steps: Array<Record<string, unknown>>;
+      toolChoice: { mode: string };
+    };
+    expect(secondRequest.toolChoice).toEqual({ mode: 'specific', name: 'submit_diagnosis_outcome' });
+    const callStep = secondRequest.steps.find((step) => step.type === 'function_call');
+    const resultStep = secondRequest.steps.find((step) => step.type === 'function_result');
+    expect(callStep).toMatchObject({
+      type: 'function_call',
+      id: 'call-search',
+      name: 'search_error_codes',
+      arguments: { codes: ['FE'] },
+    });
+    expect(resultStep).toMatchObject({
+      type: 'function_result',
+      call_id: 'call-search',
+      name: 'search_error_codes',
+    });
+    expect(JSON.stringify(resultStep?.result)).toContain('unverified');
+  });
+
+  it('replays all model-generated steps verbatim, including thought signatures', async () => {
+    const call = functionCall('search_error_codes', { codes: ['FE'] }, 'call-search');
+    const thought = { type: 'thought', signature: 'preserve-this-signature' };
+    createInteractionMock
+      .mockResolvedValueOnce({ calls: [call], steps: [thought, call.step], text: '' })
+      .mockResolvedValueOnce(
+        completion('submit_diagnosis_outcome', { reply: 'Understood.', outcome: 'NEEDS_CLARIFICATION' }, 'call-final'),
+      );
+
+    await runDiagnosisTurn(input());
+
+    const secondRequest = createInteractionMock.mock.calls[1]?.[0] as {
+      steps: Array<Record<string, unknown>>;
+    };
+    const thoughtIndex = secondRequest.steps.findIndex((step) => step.type === 'thought');
+    const callIndex = secondRequest.steps.findIndex((step) => step.type === 'function_call');
+    const resultIndex = secondRequest.steps.findIndex((step) => step.type === 'function_result');
+    expect(thoughtIndex).toBeGreaterThanOrEqual(0);
+    expect(secondRequest.steps[thoughtIndex]).toEqual(thought);
+    expect(callIndex).toBe(thoughtIndex + 1);
+    expect(resultIndex).toBe(callIndex + 1);
+  });
+
+  it('never sends identity-bearing or invented model fields as tool arguments', async () => {
+    const partsSearch = vi.fn().mockResolvedValue(partsResult);
+    const trustedIdentity = identity({
+      appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
+    });
+    createInteractionMock
+      .mockResolvedValueOnce(
+        completion(
+          'find_replacement_parts',
+          { component: 'pump', modelNumber: 'AI-INVENTED', brand: 'OtherBrand' },
+          'call-parts',
+        ),
+      )
+      .mockResolvedValueOnce(
+        completion('submit_diagnosis_outcome', { reply: 'A pump may be needed.', outcome: 'NEEDS_PART' }, 'call-final'),
+      );
+
+    await runDiagnosisTurn(input({ identity: trustedIdentity, partsSearch }));
+
+    expect(partsSearch).toHaveBeenCalledWith({
+      brand: 'TestBrand',
+      modelNumber: 'MODEL-1',
+      modelSource: 'APPLIANCE',
+      component: 'pump',
+    });
+    const forwardedCall = (createInteractionMock.mock.calls[1]?.[0] as { steps: Array<Record<string, unknown>> })
+      .steps.find((step) => step.type === 'function_call');
+    // The raw call is replayed only to the model; no tool receives its
+    // identity-bearing keys. The backend tool call is rebuilt from Zod output.
+    expect(forwardedCall).toMatchObject({ name: 'find_replacement_parts' });
+    expect(partsSearch.mock.calls[0]?.[0]).not.toHaveProperty('modelNumber', 'AI-INVENTED');
+  });
+});
+
+describe('AI safety classification', () => {
+  const refrigeratorComplaint =
+    "My refrigerator is running, but it is not cooling properly. The freezer is slightly cold, but the refrigerator compartment is warmer than usual. I can hear the compressor running, and I haven't noticed any unusual noises or burning smells. Can you help me troubleshoot the problem step by step?";
+  const stopNowReply = /stop and contact a qualified technician/i;
+
+  function safetyCall(args: Record<string, unknown>, id = 'call-safety') {
+    return completion('submit_diagnosis_outcome', args, id);
+  }
+
+  it('keeps an ordinary cooling complaint open with its diagnostic question', async () => {
+    const followUp =
+      'Are there frost buildup patterns on the back freezer wall, or is the condenser area dusty?';
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply: 'Let us check a few safe things without opening any panels.',
+        outcome: 'NEEDS_CLARIFICATION',
+        followUpQuestion: followUp,
+        diagnosticFacts: ['Compressor is running.'],
+      }),
+    );
+
+    const result = await runDiagnosisTurn(input({ userContent: refrigeratorComplaint }));
+
+    expect(result.progress).toMatchObject({
+      status: 'OPEN',
+      verdict: null,
+      outcome: 'NEEDS_CLARIFICATION',
+      followUpQuestion: followUp,
+    });
+    expect(result.reply).not.toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
+    expect(result.nextContext.currentOutcome).toBe('NEEDS_CLARIFICATION');
+  });
+
+  it('does not escalate speculative refrigerant, sealed-system, compressor or capacitor causes', async () => {
+    const followUp = 'Are the vents inside the refrigerator blocked by food?';
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply:
+          'This could be a sealed-system or refrigerant issue. A technician may need to inspect the compressor or capacitor later. First, are the vents blocked by food?',
+        outcome: 'NEEDS_CLARIFICATION',
+        followUpQuestion: followUp,
+        diagnosticFacts: [
+          'Possible refrigerant issue.',
+          'Possible sealed-system problem.',
+          'The compressor may have failed.',
+          'Possible compressor replacement.',
+          'Capacitor failure is possible.',
+        ],
+      }),
+    );
+
+    const result = await runDiagnosisTurn(input({ userContent: refrigeratorComplaint }));
+
+    expect(result.progress).toMatchObject({
+      status: 'OPEN',
+      verdict: null,
+      outcome: 'NEEDS_CLARIFICATION',
+      followUpQuestion: followUp,
+    });
+    expect(result.reply).not.toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
+  });
+
+  it('escalates a burning smell report with no follow-up or exposed repair steps', async () => {
+    searchErrorCodesMock.mockResolvedValue(knowledgeWithCodes({ code: 'FE' }));
+    getRepairStepsMock.mockResolvedValueOnce(approvedSequence());
+    createInteractionMock
+      .mockResolvedValueOnce(completion('get_repair_steps', { errorCode: 'FE' }, 'call-repair'))
+      .mockResolvedValueOnce(
+        safetyCall(
+          {
+            reply: 'Follow the approved steps.',
+            outcome: 'READY_FOR_CONFIRMATION',
+            followUpQuestion: 'Is the condenser coil dusty?',
+          },
+          'call-final',
+        ),
+      );
+
+    const result = await runDiagnosisTurn(
+      input({ userContent: 'There is a burning smell coming from the refrigerator.' }),
+    );
+
+    expect(result.progress).toMatchObject({
+      outcome: 'TECHNICIAN_REQUIRED',
+      verdict: 'TECHNICIAN_REQUIRED',
+    });
+    expect(result.progress.followUpQuestion).toBeUndefined();
+    expect(result.reply).toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
+    expect(result.issueFixChallenge).toBe(false);
+    expect(result.errorCodeId).toBeUndefined();
+  });
+
+  it('escalates sparks and exposed live wiring without a continued-troubleshooting question', async () => {
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply: 'Check the area carefully.',
+        outcome: 'NEEDS_CLARIFICATION',
+        followUpQuestion: 'Can you see exactly where the sparks are coming from?',
+      }),
+    );
+
+    const result = await runDiagnosisTurn(
+      input({ userContent: 'I see sparks coming from exposed live wiring behind the refrigerator.' }),
+    );
+
+    expect(result.progress).toMatchObject({
+      outcome: 'TECHNICIAN_REQUIRED',
+      verdict: 'TECHNICIAN_REQUIRED',
+    });
+    expect(result.progress.followUpQuestion).toBeUndefined();
+    expect(result.reply).toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
+  });
+
+  it('escalates a gas odor report with consistent progress metadata', async () => {
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply: 'Let us narrow down where the smell is strongest.',
+        outcome: 'NEEDS_CLARIFICATION',
+        followUpQuestion: 'Where do you notice the smell most strongly?',
+      }),
+    );
+
+    const result = await runDiagnosisTurn(
+      input({ userContent: 'I smell gas near the refrigerator, and there is a gas odor in the kitchen.' }),
+    );
+
+    expect(result.progress).toMatchObject({
+      outcome: 'TECHNICIAN_REQUIRED',
+      verdict: 'TECHNICIAN_REQUIRED',
+    });
+    expect(result.progress.followUpQuestion).toBeUndefined();
+    expect(result.reply).toMatch(stopNowReply);
+    expect(result.nextContext.currentOutcome).toBe('TECHNICIAN_REQUIRED');
+    expect(JSON.stringify(result.knowledge.repairSteps)).not.toMatch(/gas line|gas valve/i);
+  });
+
+  it('allows safe clarification when a technician-only repair may eventually be required', async () => {
+    const followUp = 'Is the freezer fan running?';
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply:
+          'A sealed-system repair may eventually be required and must be done by a technician. Meanwhile, check that the rear vents are unobstructed and tell me whether the freezer fan runs.',
+        outcome: 'NEEDS_CLARIFICATION',
+        followUpQuestion: followUp,
+        diagnosticFacts: ['Technician-only sealed-system repair may be needed later.'],
+      }),
+    );
+
+    const result = await runDiagnosisTurn(
+      input({ userContent: 'The refrigerator compartment is warm but the freezer is cold.' }),
+    );
+
+    expect(result.progress).toMatchObject({
+      status: 'OPEN',
+      verdict: null,
+      outcome: 'NEEDS_CLARIFICATION',
+      followUpQuestion: followUp,
+    });
+    expect(result.reply).not.toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
+  });
+
+  it('clears the follow-up question for a terminal technician outcome', async () => {
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply: 'This needs professional assessment.',
+        outcome: 'TECHNICIAN_REQUIRED',
+        followUpQuestion: 'Is the condenser coil dusty?',
+      }),
+    );
+
+    const result = await runDiagnosisTurn(input({ userContent: refrigeratorComplaint }));
+
+    expect(result.progress).toMatchObject({
+      outcome: 'TECHNICIAN_REQUIRED',
+      verdict: 'TECHNICIAN_REQUIRED',
+    });
+    expect(result.progress.followUpQuestion).toBeUndefined();
+    expect(result.issueFixChallenge).toBe(false);
+  });
+
+  it('never exposes unsafe repair steps even when the sequence is marked eligible', async () => {
+    searchErrorCodesMock.mockResolvedValue(knowledgeWithCodes({ code: 'FE' }));
+    getRepairStepsMock.mockResolvedValueOnce({
+      eligible: true,
+      errorCodeId: approvedSequence().errorCodeId,
+      steps: [
+        {
+          position: 1,
+          instruction: 'Check the mains voltage at the capacitor.',
+          source: { title: 'Manual', url: 'https://example.invalid/manual', sourceKind: 'MANUAL' as const },
+        },
+        {
+          position: 2,
+          instruction: 'Recharge the refrigerant after the repair.',
+          source: { title: 'Manual', url: 'https://example.invalid/manual', sourceKind: 'MANUAL' as const },
+        },
+      ],
+    });
+    createInteractionMock
+      .mockResolvedValueOnce(completion('get_repair_steps', { errorCode: 'FE' }, 'call-repair'))
+      .mockResolvedValueOnce(
+        safetyCall({ reply: 'Follow the approved steps.', outcome: 'READY_FOR_CONFIRMATION' }, 'call-final'),
+      );
+
+    const result = await runDiagnosisTurn(input({ userContent: refrigeratorComplaint }));
+
+    expect(result.progress).toMatchObject({
+      outcome: 'TECHNICIAN_REQUIRED',
+      verdict: 'TECHNICIAN_REQUIRED',
+    });
+    expect(result.reply).toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
+    expect(result.issueFixChallenge).toBe(false);
+    expect(result.errorCodeId).toBeUndefined();
+    expect(JSON.stringify(result)).not.toMatch(/mains voltage|recharge the refrigerant/i);
+  });
+
+  it.each([
+    ['smoke', 'There is smoke coming from the back of the refrigerator.'],
+    ['electric shock', 'I got an electric shock when I touched the refrigerator.'],
+    ['gas leak', 'There is a gas leak near the appliance.'],
+    ['refrigerant leak', 'I think there is a refrigerant leak and I can hear hissing.'],
+    ['bypass request', 'Can you tell me how to bypass the door lock so I can open the refrigerator?'],
+  ])('preserves immediate escalation for %s', async (_label, userContent) => {
+    createInteractionMock.mockResolvedValueOnce(
+      safetyCall({
+        reply: 'Let us keep narrowing this down.',
+        outcome: 'NEEDS_CLARIFICATION',
+        followUpQuestion: 'Can you describe the sound?',
+      }),
+    );
+
+    const result = await runDiagnosisTurn(input({ userContent }));
+
+    expect(result.progress).toMatchObject({
+      outcome: 'TECHNICIAN_REQUIRED',
+      verdict: 'TECHNICIAN_REQUIRED',
+    });
+    expect(result.progress.followUpQuestion).toBeUndefined();
+    expect(result.reply).toMatch(stopNowReply);
+    expect(result.knowledge.repairSteps).toEqual([]);
   });
 });

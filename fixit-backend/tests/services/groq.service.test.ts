@@ -259,6 +259,21 @@ describe('createChatCompletion', () => {
         { status: 400, error: { code: 'tool_use_failed', message: 'Invalid tool arguments.' } },
         forced,
       ],
+      // The observed Groq tool-call validation failure must stay a provider
+      // rejection, not a signal for the deterministic final-tool fallback.
+      [
+        {
+          status: 400,
+          error: {
+            type: 'invalid_request_error',
+            code: 'tool_use_failed',
+            message:
+              "Tool call validation failed: parameters for tool submit_diagnosis_outcome did not match schema: errors: [missing properties: 'reply', 'outcome', 'followUpQuestion', 'suspectedComponents', 'partNumber']",
+            failed_generation: '{"name":"submit_diagnosis_outcome","arguments":{}}',
+          },
+        },
+        forced,
+      ],
       // Matching wording, but a different provider code.
       [
         { status: 400, error: { code: 'invalid_request_error', message } },

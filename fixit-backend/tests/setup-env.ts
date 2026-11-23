@@ -10,8 +10,8 @@ if (process.env.NODE_ENV === 'production') {
 
 process.env.NODE_ENV = 'test';
 
-// Dummy values only. These point at a non-existent local database and a fake
-// Groq key so no test can reach a real service by accident.
+// Dummy values only. These point at a non-existent local database and fake
+// provider keys so no test can reach a real service by accident.
 process.env.DATABASE_URL = 'postgresql://test:test@127.0.0.1:5432/fixit_test?sslmode=disable';
 process.env.JWT_ACCESS_SECRET = 'test-only-access-secret-at-least-32-characters';
 process.env.GROQ_API_KEY = 'test-dummy-groq-key';
@@ -23,6 +23,16 @@ process.env.GROQ_MAX_TOOL_CALLS = '3';
 process.env.GROQ_HISTORY_LIMIT = '12';
 process.env.GROQ_MAX_COMPLETION_TOKENS = '1200';
 process.env.GROQ_REASONING_EFFORT = 'low';
+// Dummy Gemini values. No test is allowed to reach the live provider; service
+// tests mock @google/genai and orchestrator tests mock the adapter.
+process.env.GOOGLE_API_KEY = 'test-dummy-google-key';
+process.env.GEMINI_MODEL = 'gemini-3.5-flash-lite';
+process.env.GEMINI_TIMEOUT_MS = '30000';
+process.env.GEMINI_MAX_OUTPUT_TOKENS = '3000';
+process.env.GEMINI_THINKING_LEVEL = 'minimal';
+process.env.GEMINI_MAX_TOOL_ROUNDS = '2';
+process.env.GEMINI_MAX_TOOL_CALLS = '3';
+process.env.GEMINI_HISTORY_LIMIT = '12';
 process.env.FIX_CONFIRMATION_TTL_SECONDS = '600';
 process.env.PARTS_PROVIDER = 'none';
 process.env.PARTS_ALLOWED_DOMAINS = 'samsung.com,lg.com,partselect.com';

@@ -11,6 +11,9 @@ import {
 export type PartsQuery = {
   brand: string;
   modelNumber: string;
+  // Only the identity resolver may set this. Its presence proves the model is
+  // backed by a fresh registered appliance or versioned USER_MESSAGE evidence.
+  modelSource: 'APPLIANCE' | 'USER_MESSAGE';
   component: string;
   partNumber?: string;
 };
@@ -99,7 +102,13 @@ export function classifyCompatibility(input: {
   // An explicit statement of non-compatibility must never become a match.
   if (NEGATED_COMPATIBILITY.test(input.sourceText)) return 'UNKNOWN';
 
-  if (input.trustedSource && exactModel && partEvidence && COMPATIBILITY_CUE.test(input.sourceText)) {
+  if (
+    input.query.modelSource &&
+    input.trustedSource &&
+    exactModel &&
+    partEvidence &&
+    COMPATIBILITY_CUE.test(input.sourceText)
+  ) {
     return 'VERIFIED';
   }
   if (exactModel || partEvidence) return 'POSSIBLE_MATCH';
@@ -151,6 +160,15 @@ export async function searchReplacementParts(query: PartsQuery): Promise<PartsDt
   if (!query.brand || !query.modelNumber || !query.component) {
     return {
       note: 'Exact brand, model number and component are required before parts discovery.',
+      candidates: [],
+    };
+  }
+
+  // A model without trusted provenance must never reach a model-specific
+  // provider call or become the basis of a VERIFIED compatibility claim.
+  if (query.modelSource !== 'APPLIANCE' && query.modelSource !== 'USER_MESSAGE') {
+    return {
+      note: 'A trusted appliance model is required before model-specific parts discovery.',
       candidates: [],
     };
   }

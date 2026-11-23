@@ -1,6 +1,6 @@
 # fixit-backend — Project Context
 
-Last analyzed: 2026-11-19 (documentation-only repository audit)
+Last analyzed: 2026-11-19 (documentation-only repository audit); last updated: 2026-11-23 (Groq diagnosis investigation resolved in favor of Gemini; Swagger safety/completion checks, model-scope behavior, verification results, and next OCR-planning direction recorded)
 Repository: `D:\fixit` (monorepo-ish: Expo app at root, API in `fixit-backend/`)
 
 ## 1. What this is
@@ -10,14 +10,22 @@ photographs an appliance model sticker or error-code display, the backend identi
 appliance and error code, then runs an AI-assisted troubleshooting conversation that can
 end in one of four verdicts: `FIXED`, `NEEDS_PART`, `TECHNICIAN_REQUIRED`, `UNRESOLVED`.
 
-**Audited current state (2026-11-19):** this is no longer an early-stage scaffold. The
+**Audited current state (2026-11-23):** this is no longer an early-stage scaffold. The
 repository contains implemented auth, database-backed diagnosis sessions/messages,
-knowledge retrieval with approval/scope/safety policy, a Groq adapter and bounded tool
-loop, backend-controlled verdict/confirmation/completion, idempotent AI turns, and a
-replaceable parts provider. It is still a working tree of uncommitted feature work, and
-several items are explicitly **UNVERIFIED** (especially live Groq fallback activation,
-live parts discovery, and production promotion). Do not treat implementation or passing
+knowledge retrieval with approval/scope/safety policy, a Gemini Interactions API adapter
+and bounded tool loop for diagnosis, backend-controlled verdict/confirmation/completion,
+idempotent AI turns, and a replaceable parts provider whose optional `groq_browser` mode
+is the only active Groq usage. It is still a working tree of uncommitted feature work, and
+several items are explicitly **UNVERIFIED** (especially live Gemini fallback activation,
+live Groq parts discovery, and production promotion). Do not treat implementation or passing
 mocked tests as production readiness or as explicit phase approval.
+
+**2026-11-23 provider decision:** Groq tool-calling for diagnosis was investigated and the
+troubleshooting attempts were unsuccessful; diagnosis integration was switched to Gemini, and
+Gemini diagnosis was tested manually through Swagger. Groq remains solely the optional
+`PARTS_PROVIDER=groq_browser` browser-based parts provider. Parts search has **not** migrated
+to Gemini, and this decision does not enable or verify live `groq_browser` discovery (see §9
+and §12.4).
 
 ## 2. Stack
 
@@ -29,7 +37,8 @@ mocked tests as production readiness or as explicit phase approval.
 | Database       | PostgreSQL (Neon), via Prisma 7.10.1 + `@prisma/adapter-pg` driver adapter |
 | Validation     | Zod 4 (env vars, requests, tool I/O, structured AI outcomes, and persisted JSON) |
 | Auth           | `bcryptjs` password hashes, `jsonwebtoken` access tokens, opaque hashed refresh tokens |
-| AI provider    | `groq-sdk` 1.6; backend adapter, sanitized diagnostics, bounded tool loop, forced final `submit_diagnosis_outcome`, and narrow deterministic fallback are implemented. Current default model: `openai/gpt-oss-20b` (overridable with `GROQ_MODEL`) |
+| Diagnosis AI provider | `@google/genai` 3.6.1 via `src/services/ai/provider.ts`; Gemini Interactions API, sanitized diagnostics, bounded tool loop, forced final `submit_diagnosis_outcome`, and narrow deterministic fallback are implemented. Selected model: `gemini-3.5-flash-lite` (locked via `GEMINI_MODEL`) |
+| Optional parts provider | `groq-sdk` 1.6 via `src/services/groq.service.ts`; used only when `PARTS_PROVIDER=groq_browser`. `GROQ_MODEL` defaults to `openai/gpt-oss-20b` |
 | Dev runner     | `tsx watch`                                                         |
 | Tests          | Vitest 5 + Vite 8 + Supertest 7 (`npm test` = DB-free `vitest run`; `npm run test:db` = isolated DB suite) |
 | Lint / format  | **None configured**                                                 |
@@ -53,18 +62,24 @@ fixit-backend/
 ├─ tests/
 │  ├─ setup-env.ts       # refuses NODE_ENV=production; sets dummy env before imports
 │  ├─ config/env.test.ts # env schema + production guard tests
-│  ├─ dependencies/groq-sdk.test.ts # ESM import/construction only, no network
+│  ├─ dependencies/groq-sdk.test.ts # optional Groq parts dependency smoke test (ESM import/construction only, no network)
 │  ├─ docs/openapi.contract.test.ts # spec/validator/DTO drift contract tests
+│  ├─ docs/appliance.openapi.test.ts # appliance OpenAPI contract tests
 │  ├─ http/app.test.ts   # Supertest smoke tests (no database)
 │  ├─ http/diagnosis.routes.test.ts # auth/validation/CORS/route contract tests
-│  ├─ services/          # DB-free unit tests: AI tools, orchestrator, Groq mapping,
-│  │                     # knowledge, parts, repair resolution, diagnosis service
-│  └─ db/                # Phase 4A: isolated fixit-test runner only
+│  ├─ http/appliance.routes.test.ts # appliance route contracts (service mocked, no database)
+│  ├─ controllers/       # appliance controller unit tests (no database)
+│  ├─ services/          # DB-free unit tests: AI tools, orchestrator, Gemini/Groq provider mapping,
+│  │                     # knowledge, parts, repair resolution, diagnosis/appliance services
+│  ├─ validators/        # appliance validator tests
+│  ├─ types/             # appliance DTO tests
+│  └─ db/                # isolated fixit-test runner only (Phase 4A + Phase 10A.4)
 │     ├─ setup-db-env.ts # fail-closed allowlist/opt-in guard; sets pooled test URL
 │     ├─ helpers.ts      # user/appliance/session fixtures and cleanup
 │     ├─ guards.test.ts  # negative guard cases, fail before any connection
 │     ├─ smoke.test.ts   # read-only connectivity/schema/sentinel checks
-│     └─ diagnosis.integration.test.ts # persistence, idempotency, knowledge, confirm/complete
+│     ├─ diagnosis.integration.test.ts # persistence, idempotency, knowledge, confirm/complete
+│     └─ appliance.integration.test.ts # real PostgreSQL appliance CRUD, ownership, pagination, FK behavior
 ├─ prisma/
 │  ├─ schema.prisma      # 9 models, 8 enums
 │  └─ migrations/
@@ -87,18 +102,22 @@ fixit-backend/
    ├─ routes/
    │  ├─ health.routes.ts        # /health/live, /health/ready, /health alias
    │  ├─ auth.routes.ts          # register/login/refresh/logout/change-password, GET me
-   │  └─ diagnosis.routes.ts     # 7 authenticated routes; all implemented, no 501 stubs
+   │  ├─ diagnosis.routes.ts     # 7 authenticated routes; all implemented, no 501 stubs
+   │  └─ appliance.routes.ts     # 5 authenticated /appliances CRUD routes
    ├─ controllers/
    │  ├─ auth.controller.ts      # auth HTTP handlers
-   │  └─ diagnosis.controller.ts # diagnosis HTTP handlers
+   │  ├─ diagnosis.controller.ts # diagnosis HTTP handlers
+   │  └─ appliance.controller.ts # appliance CRUD HTTP handlers
    ├─ services/
    │  ├─ auth.service.ts / password.service.ts / token.service.ts
+   │  ├─ appliance.service.ts    # owner-scoped appliance CRUD; server-derived userId
    │  ├─ session.service.ts      # session CRUD and ownership-scoped reads
    │  ├─ diagnosis.service.ts    # AI turns, idempotency, confirm/complete, persistence
    │  ├─ knowledge.service.ts    # approval/scope/safety-aware KB retrieval
-   │  ├─ groq.service.ts         # timeout/retry/error mapping + sanitized diagnostics
+   │  ├─ groq.service.ts         # optional Groq browser parts provider client: timeout/retry/error mapping + sanitized diagnostics
    │  ├─ ai/
    │  │  ├─ orchestrator.ts      # tool loop, backend overrides, forced-tool fallback
+   │  │  ├─ provider.ts          # Gemini Interactions API client/tool-call mapping
    │  │  ├─ prompt.ts            # trusted context + explicit final-tool instructions
    │  │  └─ tool-definitions.ts  # 4 explicit tools, strict final outcome contract
    │  ├─ parts.service.ts        # none default; opt-in groq_browser path
@@ -114,10 +133,12 @@ fixit-backend/
    ├─ validators/
    │  ├─ auth.validator.ts       # register/login/refresh/change-password schemas
    │  ├─ diagnosis.validator.ts  # session/message/confirm/complete schemas
+   │  ├─ appliance.validator.ts  # appliance create/update/query/param schemas
    │  └─ ai.validator.ts         # bounded tool args/outcomes, context, metadata, DTOs
    ├─ types/
    │  ├─ express.d.ts            # req.user / req.validatedQuery declarations
-   │  └─ diagnosis.dto.ts        # explicit session/message/turn DTO mappers and selects
+   │  ├─ diagnosis.dto.ts        # explicit session/message/turn DTO mappers and selects
+   │  └─ appliance.dto.ts        # explicit appliance DTO mapper and select (no userId)
    ├─ docs/
    │  ├─ openapi.ts              # OpenAPI 3.0.3 spec for all live endpoints
    │  └─ swagger.ts              # opt-in Swagger UI + raw spec router
@@ -131,9 +152,10 @@ fixit-backend/
    └─ generated/prisma/          # Prisma client output, GITIGNORED
 ```
 
-`src/app.ts` mounts `/health`, `/auth`, and `/diagnosis`; `/docs` is mounted only when
-`ENABLE_API_DOCS=true`. CORS runs before the routers. No `501 NOT_IMPLEMENTED` stub remains
-in `src/`: all seven diagnosis routes, including `/confirm` and `/complete`, are implemented.
+`src/app.ts` mounts `/health`, `/auth`, `/diagnosis`, and `/appliances`; `/docs` is mounted only
+when `ENABLE_API_DOCS=true`. CORS runs before the routers. No `501 NOT_IMPLEMENTED` stub remains
+in `src/`: all seven diagnosis routes, including `/confirm` and `/complete`, and all five
+appliance CRUD routes are implemented.
 The historical Swagger work described in earlier notes as uncommitted was already committed
 at the start of Phase 3 (single commit `15ccfeb`) and was preserved at that time; it has since
 been updated to document the live endpoints. `postinstall` now runs `prisma generate`, but
@@ -150,9 +172,11 @@ running `npx prisma generate` explicitly after a fresh clone remains safe (see �
 4. `app.use("/auth", authRouter)` — per-IP in-memory rate limit, auth-first where required, Zod bodies
 5. `app.use("/diagnosis", diagnosisRouter)` — `requireAuth` first, route-specific rate limit on
    message turns, then Zod params/query/body validation
-6. `app.use("/docs", docsRouter)` — Swagger UI/OpenAPI JSON, mounted only when `ENABLE_API_DOCS=true`
-7. `notFound` → `{ success:false, error:{ code:"NOT_FOUND", message:"Route not found" } }`, 404
-8. `errorHandler` → expected failures thrown as `HttpError` keep their status/code;
+6. `app.use("/appliances", applianceRouter)` — `requireAuth` first, shared `appliance-write`
+   rate limit on POST/PATCH/DELETE, then Zod params/query/body validation
+7. `app.use("/docs", docsRouter)` — Swagger UI/OpenAPI JSON, mounted only when `ENABLE_API_DOCS=true`
+8. `notFound` → `{ success:false, error:{ code:"NOT_FOUND", message:"Route not found" } }`, 404
+9. `errorHandler` → expected failures thrown as `HttpError` keep their status/code;
    unknown errors log their stack server-side and return `INTERNAL_ERROR` / 500. Never leaks
    internals. If headers were already sent it delegates back to Express.
 
@@ -198,11 +222,16 @@ text in `message`.
 | POST   | `/diagnosis/:id/messages` | Working | Auth + UUID param + `{ requestId, content }` → 201 `TurnDto`; runs the AI turn and persists one USER + one ASSISTANT message. Only for owned OPEN sessions; same `requestId` replays the stored turn. Per-user rate limited. |
 | POST   | `/diagnosis/:id/confirm` | Working | Auth + UUID param + `{ challengeId }` → server-issued, unexpired single-use challenge is hashed/cleared atomically; sets `COMPLETED + FIXED`. No client verdict is accepted. |
 | POST   | `/diagnosis/:id/complete` | Working | Auth + UUID param + `{ acknowledged: true }` → completes only a session whose backend-set verdict is `NEEDS_PART`, `TECHNICIAN_REQUIRED`, or `UNRESOLVED`. |
+| POST   | `/appliances` | Working | Auth + validated body → 201 `ApplianceDto`; server-derived `userId`, generated id, nullable defaults; write rate limited. |
+| GET    | `/appliances` | Working | Auth + paginated query (`page=1`, `limit=20`, max 100) → 200 owner-scoped paginated `ApplianceDto` list, `createdAt DESC, id DESC`. |
+| GET    | `/appliances/:id` | Working | Auth + UUID param → 200 `ApplianceDto` for an owned appliance; missing/foreign → 404 `APPLIANCE_NOT_FOUND`. |
+| PATCH  | `/appliances/:id` | Working | Auth + UUID param + partial body → 200 updated `ApplianceDto`; explicit `null` clears nullable fields; missing/foreign → identical 404; write rate limited. |
+| DELETE | `/appliances/:id` | Working | Auth + UUID param → 200 `{ message: "Appliance deleted" }`; hard-deletes only the appliance via `ON DELETE SET NULL` for sessions; write rate limited. |
 | OPTIONS| any path | Working | CORS preflight → `204` for allowed/no-Origin requests; 403 `ORIGIN_NOT_ALLOWED` for a disallowed browser origin |
 
-There are **no** `/appliances` CRUD routes and **no** image-upload or OCR route anywhere in
-`src/`, `tests/`, or `src/docs/openapi.ts`. `Appliance` rows currently exist only through
-direct Prisma fixture creation in tests; diagnosis requires an existing owned appliance id.
+`/appliances` CRUD is implemented, documented, manually verified, and covered by real DB
+integration tests (Phase 10A.4). There is still **no** image-upload or OCR route anywhere in
+`src/` or `src/docs/openapi.ts`; diagnosis still requires an existing owned appliance id.
 
 Auth contract: register/login return
 `{ user, tokens: { accessToken, refreshToken, tokenType: "Bearer", expiresIn } }`.
@@ -236,7 +265,7 @@ KnowledgeSource 1─* ErrorCode / RepairStep
 | ------------------- | -------------------------------- | --------------- |
 | `User`              | Owner of all data and login account | `email` + `username` unique and stored lowercase; `passwordHash` bcrypt only; `updatedAt` |
 | `RefreshToken`      | Rotatable login session / token family | `familyId` shared across rotations, `tokenHash` unique (SHA-256), `expiresAt`, optional `revokedAt`; cascades with user |
-| `Appliance`         | Saved machine                    | `category` + `brand` required; `modelNumber`, `nickname` optional; cascade with user |
+| `Appliance`         | Saved machine                    | `category` + `brand` required; `modelNumber`, `nickname` optional; cascade with user; sessions use `ON DELETE SET NULL` (verified live in Phase 10A.4) |
 | `KnowledgeSource`   | Provenance of knowledge          | `kind`: MANUAL / MANUFACTURER_PAGE / OTHER / TEST_FIXTURE; `Restrict` delete |
 | `ErrorCode`         | What a code means                | Unique `(category, brand, code, modelScope)`; `modelScope` required, `"UNSPECIFIED"` when unknown; source required, `Restrict` |
 | `RepairStep`        | One safe action                  | `safetyClass`: USER_SAFE / TECHNICIAN_ONLY; `difficulty` nullable |
@@ -266,7 +295,7 @@ finished migrations. Do not apply this or any migration to production; only the 
 - All knowledge writes must funnel through a single transactional module. The starter seed
   (`src/scripts/seed.ts`) is currently the only transactional knowledge-write path; a
   general runtime/editing module does not exist yet.
-- All Groq/tool output is advisory. Backend code validates tool args/results with Zod,
+- All AI/tool output (Gemini diagnosis and optional Groq parts) is advisory. Backend code validates tool args/results with Zod,
   resolves manufacturer codes to internal UUIDs with a fresh trusted `searchErrorCodes()`
   lookup scoped by category/brand/model, and never accepts an internal `errorCodeId` from
   the model. The 36-character repair-code bound is enforced in both the tool schema and Zod.
@@ -279,7 +308,7 @@ finished migrations. Do not apply this or any migration to production; only the 
 
 | Var            | Used by                                | Notes |
 | -------------- | -------------------------------------- | ----- |
-| `NODE_ENV`     | `src/config/env.ts`                    | **required, no default**: `development` / `test` / `production`. Production enforces Groq key, unreviewed-knowledge, and rate-limit guards |
+| `NODE_ENV`     | `src/config/env.ts`                    | **required, no default**: `development` / `test` / `production`. Production requires `GOOGLE_API_KEY`, enforces unreviewed-knowledge and rate-limit guards, and requires `GROQ_API_KEY` only when `PARTS_PROVIDER=groq_browser` |
 | `PORT`         | `src/config/env.ts` → `server.ts`      | default `3000`; supplied values coerced to int 1–65535 |
 | `DATABASE_URL` | `src/config/prisma.ts` (runtime); seed host validation | must be `postgres://` or `postgresql://`; pooled runtime connection. Local `.env` points to the development project |
 | `DIRECT_URL`   | `prisma.config.ts` (migrations/introspection) and seed | direct/session connection. Local `.env` points to the development project |
@@ -292,9 +321,12 @@ finished migrations. Do not apply this or any migration to production; only the 
 | `JWT_ACCESS_SECRET` | `src/config/env.ts` → `token.service.ts` | **required**, minimum 32 characters; changing it invalidates every access token |
 | `ACCESS_TOKEN_TTL_SECONDS` | `src/config/env.ts` → `token.service.ts` | default `900` (15 min), allowed 60–86400 |
 | `REFRESH_TOKEN_TTL_DAYS` | `src/config/env.ts` → `token.service.ts` | default `30`, allowed 1–365 |
-| `GROQ_API_KEY` | `groq.service.ts`, opt-in parts browser search | backend-only credential; optional in development/test, **required in production**; empty/whitespace counts as absent; never logged |
-| `GROQ_MODEL`   | `groq.service.ts` / `parts.service.ts` | tool-capable model id; **current default `openai/gpt-oss-20b`** (the historical Phase 2 default was `openai/gpt-oss-120b`; see D3) |
-| `GROQ_TIMEOUT_MS` / `GROQ_MAX_RETRIES` / `GROQ_MAX_TOOL_ROUNDS` / `GROQ_MAX_TOOL_CALLS` / `GROQ_HISTORY_LIMIT` / `GROQ_MAX_COMPLETION_TOKENS` / `GROQ_REASONING_EFFORT` | Groq adapter/orchestrator | bounded timeout, retries, tool loop, history, tokens, and reasoning effort; defaults `15000` / `1` / `2` / `3` / `12` / `1200` / `low` |
+| `GOOGLE_API_KEY` | `src/services/ai/provider.ts` via `env` | backend-only Gemini credential; optional in development/test, **required in production**; never logged |
+| `GEMINI_MODEL` | `src/services/ai/provider.ts` | locked to `gemini-3.5-flash-lite`; diagnosis must not switch provider or model through configuration |
+| `GEMINI_TIMEOUT_MS` / `GEMINI_MAX_OUTPUT_TOKENS` / `GEMINI_THINKING_LEVEL` / `GEMINI_MAX_TOOL_ROUNDS` / `GEMINI_MAX_TOOL_CALLS` / `GEMINI_HISTORY_LIMIT` | `src/services/ai/provider.ts` / `orchestrator.ts` / `diagnosis.service.ts` | bounded Gemini request and tool-loop settings; defaults `30000` / `3000` / `minimal` / `2` / `3` / `12` |
+| `GROQ_API_KEY` | `groq.service.ts`, opt-in parts browser search | backend-only credential for the optional `groq_browser` parts provider; optional in development/test, **required in production only when that provider is enabled**; empty/whitespace counts as absent; never logged |
+| `GROQ_MODEL`   | `groq.service.ts` / `parts.service.ts` | model id for the optional `groq_browser` parts provider only; **current default `openai/gpt-oss-20b`** (the historical Phase 2 diagnosis default was `openai/gpt-oss-120b`; see D3) |
+| `GROQ_TIMEOUT_MS` / `GROQ_MAX_RETRIES` / `GROQ_MAX_TOOL_ROUNDS` / `GROQ_MAX_TOOL_CALLS` / `GROQ_HISTORY_LIMIT` / `GROQ_MAX_COMPLETION_TOKENS` / `GROQ_REASONING_EFFORT` | optional Groq parts adapter (legacy diagnosis bounds retained for config compatibility) | `GROQ_TIMEOUT_MS` / `GROQ_MAX_RETRIES` are consumed by `groq.service.ts`; the tool-loop/history/token/effort variables remain schema-validated but are not used by the Gemini diagnosis flow. Defaults `15000` / `1` / `2` / `3` / `12` / `1200` / `low` |
 | `FIX_CONFIRMATION_TTL_SECONDS` | `diagnosis.service.ts` | default `600`; server-issued `FIXED` confirmation TTL |
 | `PARTS_PROVIDER` | `parts.service.ts` | `none` (default, no provider call) or `groq_browser` (opt-in, uses Groq browser search) |
 | `PARTS_ALLOWED_DOMAINS` / `PARTS_MAX_RESULTS` | `parts.service.ts` | HTTPS host allowlist and result cap for parts candidates |
@@ -317,7 +349,7 @@ Configuration is split so the rules are testable: `env.schema.ts` is a pure Zod 
 `process.env`, prints only variable names/messages (never values), and exits `1` on failure.
 `server.ts` imports `env` before `app` so invalid configuration fails before the app or
 database client is constructed. The variables previously listed as deferred are now active
-in the repository: Groq bounds, `FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER`. No new
+in the repository: Gemini settings, legacy Groq bounds (optional parts provider), `FIX_CONFIRMATION_TTL_SECONDS`, and `PARTS_PROVIDER`. No new
 secret or full connection URL may be printed in logs, tests, or documentation.
 
 Gotcha: env validation in `env.ts` validates the application vars above; `SEED_TARGET` is
@@ -364,21 +396,42 @@ npx tsx src/scripts/test-prisma.ts         # one-off connection smoke test
 There is **no lint script or ESLint/Prettier config** in the backend. Run typecheck and
 `git diff --check` instead.
 
-`npm test` currently passes **171 runtime tests across 12 DB-free files** (re-run during this
-audit on 2026-11-19). Coverage includes env/production guards, HTTP envelopes/rate limiting,
-all diagnosis route contracts, OpenAPI drift, knowledge approval/scope/safety, Groq error
-mapping/redaction, AI tool schemas, orchestration and backend overrides, forced-tool fallback,
-parts classification, and diagnosis service replay/idempotency/confirm/complete. These tests
-use dummy credentials and make no database, network, or live AI calls.
+The 2026-11-20 post-Phase-10A.4 run of `npm test` passed **294 runtime tests across 18
+DB-free files**. Coverage includes env/production guards, HTTP envelopes/rate limiting,
+diagnosis and appliance route contracts, OpenAPI drift, knowledge approval/scope/safety, Groq
+error mapping/redaction, AI tool schemas, orchestration and backend overrides, forced-tool
+fallback, parts classification, diagnosis service replay/idempotency/confirm/complete, and
+appliance validator/DTO/service/controller tests. These tests use dummy credentials or mocked
+boundaries and make no database, network, or live AI calls. The 2026-11-19 audit baseline was
+171/171 in 12 files.
 
-`npm run test:db` has **32 tests across 3 files** against `fixit-test` only: 9 fail-closed
-guard cases, 6 read-only schema/smoke checks (including the five expected migrations), and 17
-diagnosis integration cases (creation/ownership, message turns and replay, approved fixture,
-challenge issuance, and confirm/complete lifecycle). The last full DB run recorded in the
-working history was **32/32**; it was **not rerun for the latest forced-tool fallback change**
-because no persistence code changed. `tests/setup-env.ts` refuses `NODE_ENV=production`;
+**Latest reported verification (2026-11-23):** `npm test` passed **352 tests across 22
+DB-free files**; `npm run typecheck` and `npm run typecheck:test` passed; `npm run build` passed.
+`git diff --check` was blocked by **pre-existing trailing whitespace in
+`src/middleware/rateLimit.ts:16`**, not by this documentation task. These results are reported
+for the 2026-11-23 diagnosis/model-scope work and must not be read as every command being
+rerun after every change. No database tests (`npm run test:db`) were run during the model-scope
+investigation, and that investigation performed no production database access and no live
+Gemini or Groq calls. The separate manual Gemini diagnosis checks through Swagger are recorded
+in §9; do not conflate them with the model-scope investigation.
+
+`npm run test:db` has **44 tests across 4 files** against `fixit-test` only after Phase 10A.4:
+9 fail-closed guard cases, 6 read-only schema/smoke checks (including the five expected
+migrations), 17 diagnosis integration cases (creation/ownership, message turns and replay,
+approved fixture, challenge issuance, and confirm/complete lifecycle), and 12 new appliance
+integration cases (real CRUD persistence, ownership isolation, ordering/pagination, updates,
+deletion with `ON DELETE SET NULL`, message preservation, and authenticated HTTP routes). The
+full DB suite passed **44/44** on 2026-11-20 after the fail-closed guard verified the isolated
+target; the prior baseline was **32/32 in 3 files** and was not rerun for the forced-tool
+fallback change or Phases 10A.1–10A.3. `tests/setup-env.ts` refuses `NODE_ENV=production`;
 `tests/db/setup-db-env.ts` additionally requires `RUN_DB_TESTS=1` and an exact `fixit-test`
-host allowlist match, and never prints values, credentials, or full URLs.
+host allowlist match, and never prints values, credentials, or full URLs. A non-blocking `pg`
+SSL-mode deprecation warning persists.
+
+Successful real-knowledge `/confirm` end-to-end testing remains PENDING because isolated
+`fixit-test` has no approved knowledge records; mocked/`TEST_FIXTURE` coverage is not a
+real-knowledge proof. The user decided to leave knowledge data and approval statuses unchanged
+and not to copy development knowledge into `fixit-test`. Status details are in §9.
 
 ## 8. Conventions observed in the code
 
@@ -409,10 +462,10 @@ host allowlist match, and never prints values, credentials, or full URLs.
 **Audited current state (2026-11-19):** the repository now implements env validation,
 Prisma client with driver adapter, health probes, error envelope, `HttpError` handling,
 404/500 handling, the complete email/password auth flow, owner-scoped diagnosis session and
-message persistence, backend knowledge retrieval with approval/scope/safety policy, a Groq
-adapter with bounded tool loop, orchestration with backend-controlled verdicts and challenge
-lifecycle, idempotent AI turns with replay recovery, and a replaceable parts provider with a
-safe disabled default. The earlier statement that auth was the only complete feature is
+message persistence, backend knowledge retrieval with approval/scope/safety policy, a Gemini
+Interactions API adapter with bounded tool loop, orchestration with backend-controlled
+verdicts and challenge lifecycle, idempotent AI turns with replay recovery, and a replaceable
+parts provider whose Groq browser mode is opt-in with a safe disabled default. The earlier statement that auth was the only complete feature is
 historical; it is superseded by the source and test evidence recorded below.
 
 Historical auth detail (still true): password change verifies the current password, rejects an
@@ -467,18 +520,24 @@ Knowledge-base read-only audit and scoped approval (2026-11-16, development Neon
 
 Current gaps and unverified items, roughly in dependency order:
 
-1. **Authenticated Appliance CRUD is ABSENT.** No `/appliances` route, controller, service,
-   validator, DTO, OpenAPI path, or test exists. The Prisma `Appliance` model exists
-   (`category`, `brand`, optional `modelNumber`/`nickname`) and diagnosis only reads/validates
-   ownership of an already-existing `applianceId`. This is the next planned backend phase.
+1. **AI appliance identity hardening is the next planned backend gap (Phase 10B, PENDING).**
+   Authenticated Appliance CRUD is now IMPLEMENTED, TESTED (DB-free and isolated DB), manually
+   verified by the user, and APPROVED BY USER through Phases 10A.1–10A.4. The Prisma `Appliance`
+   model (`category`, `brand`, optional `modelNumber`/`nickname`) is exposed through five
+   owner-scoped routes with explicit validators/DTOs and real DB integration coverage. No
+   Phase 10B work has started.
 2. **OCR and image upload are ABSENT.** `src/services/appliance-scan.service.ts` is an empty
    placeholder; no OCR dependency, upload route, storage policy, or review/correction API
    exists. The root Expo `scan` screen captures/picks a photo locally but never uploads it.
-3. **Groq live reliability remains UNVERIFIED.** The deterministic fallback is narrowly
-   tested with mocks. The Samsung `WW80T3040WW` live test (recorded separately below)
-   verified safe behavior but did not prove fallback activation. A controlled live test that
-   triggers the exact provider rejection is still required. A 200 response with no tool call
-   is not covered by the fallback and still becomes `AI_INVALID_RESPONSE`.
+   The agreed next feature direction is to plan a simplified OCR flow (error codes only,
+   user-entered brand/model, user review/correction); OCR implementation is not approved.
+3. **Gemini diagnosis reliability remains UNVERIFIED.** The deterministic final-tool fallback
+   is narrowly tested with mocks; a controlled live test that triggers the exact provider
+   rejection is still required. A 200 response with no tool call is not covered by that
+   fallback and still becomes `AI_INVALID_RESPONSE`. Gemini was manually checked through
+   Swagger (details below); Groq diagnosis troubleshooting was unsuccessful and Groq is now
+   only the optional browser-based parts provider. Historical Groq diagnosis notes below are
+   retained as history, not current architecture.
 4. **Parts discovery is implemented but externally UNVERIFIED.** Local/default
    `PARTS_PROVIDER=none` disables calls; the `groq_browser` code path and compatibility
    classification are unit-tested but have not been verified with live browser search.
@@ -487,7 +546,8 @@ Current gaps and unverified items, roughly in dependency order:
    upgrade later phases to `APPROVED BY USER` without an explicit user action.
 6. **Phase 9 is PARTIAL.** Rate limiting, CORS allowlist, docs opt-in, DTO allowlists,
    redacted AI diagnostics, and OpenAPI contract tests exist. SSE/streaming does not;
-   `createChatCompletion` explicitly rejects streaming completions. D7 remains open.
+   the optional Groq parts helper `createChatCompletion` explicitly rejects streaming
+   completions. D7 remains open.
 7. **Operational hardening gaps remain:** in-memory rate limiting is single-process only;
    email verification, password reset, account lockout, session listing/revocation, and
    distributed rate limiting are absent. Access tokens remain stateless until expiry.
@@ -496,6 +556,37 @@ Current gaps and unverified items, roughly in dependency order:
 9. Deferred by design: appliance model/family tables, review audit records (who approved),
    standalone symptom/cause knowledge, push tokens, subscriptions, image/storage services,
    and production knowledge promotion. Never add these implicitly.
+
+### 2026-11-23 manual diagnosis and model-scope verification
+
+Manual Swagger checks against the live diagnosis endpoint:
+
+- A normal refrigerator troubleshooting complaint correctly returned `OPEN` with the
+  intermediate `NEEDS_CLARIFICATION` outcome and a relevant follow-up question.
+- A refrigerator complaint involving burning smell and smoke correctly returned
+  `TECHNICIAN_REQUIRED` with no repair steps and no follow-up questions.
+- `POST /diagnosis/:id/complete` was tested successfully. Completion preserved the
+  `TECHNICIAN_REQUIRED` verdict. The terminal technician-required session lifecycle has not
+  been fully investigated.
+
+Successful real-knowledge `/confirm` end-to-end testing remains PENDING because isolated
+`fixit-test` has no approved knowledge records. Mocked/`TEST_FIXTURE` integration tests cover
+challenge issuance and single-use confirmation but are not a real-knowledge proof. The user
+decided to leave knowledge records and approval statuses unchanged, not to copy development
+knowledge into `fixit-test`, and to proceed. No knowledge data was changed for that decision.
+
+Appliance model-scope behavior verified in the current implementation:
+
+- Model scope is resolved from explicit USER-authored diagnosis messages only. The registered
+  appliance model number is not used to infer model scope.
+- Washing-machine scopes include `TOP_LOAD` and `FRONT_LOAD` (the existing refrigerator pattern
+  also supports `FRENCH_DOOR_BOTTOM_FREEZER`).
+- The resolved trusted appliance identity, including model scope, is persisted in
+  `DiagnosisSession.context` and reused on later turns.
+- `UNSPECIFIED` is not a wildcard for approved knowledge matching; applicable knowledge still
+  requires an exact scope match.
+- The user does not want an appliance subtype migration or a broader model-scope redesign at
+  this stage.
 
 ## 10. Connecting from the Expo app
 
@@ -558,12 +649,13 @@ Frontend integration is a separate future milestone and is not authorized by thi
 
 ### Persistent progress tracker
 
-- **Current audited implementation state (2026-11-19):** original Phases 1–7 are implemented in source; Phase 8 is implemented with a safe disabled default and an externally unverified opt-in provider; Phase 9 is partial (hardening/docs yes, SSE absent). See the audit correction below for evidence and status labels.
-- **Latest completed work:** Groq final-round reliability — prompt strengthening plus narrow deterministic backend fallback. IMPLEMENTED; unit-tested; **not live-activation-verified**; no explicit roadmap phase approval recorded.
-- **Last unit-test result:** `npm test` 171/171 in 12 DB-free files; `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `git diff --check` passed on 2026-11-19.
-- **Last DB integration result:** 32/32 in 3 files against isolated `fixit-test`; **NOT rerun for the latest fallback change** because persistence code did not change.
-- **Last phase explicitly approved by user:** Phase 4B (2026-11-19). Phase 4A was approved 2026-11-17; Phase 3 on 2026-11-17; Phase 2 on 2026-11-17; Phase 1 on 2026-11-16. Do not infer approval for Phases 5–9.
-- **Next planned implementation (awaiting explicit authorization):** Phase 10 — Authenticated Appliance CRUD. Phase 5–8 code already exists but has no recorded explicit phase approval; do not start any implementation until the user authorizes the specific task.
+- **Current implementation state (2026-11-20 progress update):** original Phases 1–7 are implemented in source; Phase 8 is implemented with a safe disabled default and an externally unverified opt-in provider; Phase 9 is partial (hardening/docs yes, SSE absent); Phase 10A.1–10A.4 are implemented, tested and approved. See the audit correction below for the 2026-11-19 evidence and status labels.
+- **Latest completed work:** Phase 10A.4 — Appliance Database Integration Tests. IMPLEMENTED; REAL DB TESTS PASSED; FINAL READ-ONLY REVIEW PASSED; **APPROVED BY USER (2026-11-20)**. It followed Phase 10A.3 — Appliance Controllers, Routes & HTTP Integration (manual CRUD verified by user; **APPROVED BY USER 2026-11-20**), Phase 10A.2 — Appliance Service & Business Logic (**APPROVED BY USER 2026-11-20**), and Phase 10A.1 — Appliance Validation and DTO Boundary (**APPROVED BY USER 2026-11-20**).
+- **Last unit-test result:** `npm test` 294/294 in 18 DB-free files (Phase 10A.2 baseline 233/233 in 15; Phase 10A.1 baseline 208/208 in 14; 2026-11-19 baseline 171/171 in 12); `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `git diff --check` passed on 2026-11-20. Focused pre-Phase-10A.4 controller/HTTP/OpenAPI run was 61/61.
+- **Last DB integration result:** focused appliance DB run 12/12; full `npm run test:db` **44/44 in 4 files** on 2026-11-20 against isolated `fixit-test` (prior baseline 32/32 in 3 files). Covers 12 new real PostgreSQL appliance CRUD tests plus existing guard/smoke/diagnosis tests; the fail-closed guard passed before any DB operation. Database safety: `fixit-development-preserved` is the development database only; integration tests must use isolated `fixit-test` under the existing exact host allowlist and `RUN_DB_TESTS=1`; production must never be accessed or modified.
+- **Last phase explicitly approved by user:** Phase 10A.4 (2026-11-20). Prior explicit approvals are preserved: Phase 10A.3 (2026-11-20), Phase 10A.2 (2026-11-20), Phase 10A.1 (2026-11-20), Phase 4B (2026-11-19), Phase 4A (2026-11-17), Phase 3 (2026-11-17), Phase 2 (2026-11-17), Phase 1 (2026-11-16). Do not infer approval for Phases 5–9 or for any future phase.
+- **Manual verification:** the user manually tested Appliance CRUD — `POST /appliances`, `GET /appliances` (list), `GET /appliances/:id` (individual), `PATCH /appliances/:id`, and `DELETE /appliances/:id` — and all five operations worked. This was recorded under Phase 10A.3 and remains valid after Phase 10A.4.
+- **Next planned implementation (awaiting explicit authorization):** **Phase 10B — AI Appliance Identity Hardening**. Phase 10A.1–10A.4 are complete and approved; Phase 10B, Phase 11 (OCR) and Phase 12 (frontend) remain PENDING and unauthorized. Phase 5–8 code already exists but has no recorded explicit phase approval; do not start any implementation until the user authorizes the specific task.
 - **Outstanding decisions:** D1–D5 and D8–D10 resolved; D3's historical default (`openai/gpt-oss-120b`) was later changed by implementation to `openai/gpt-oss-20b` (see D3); D6 is resolved only as an implementation mechanism (`PARTS_PROVIDER=none` default, opt-in `groq_browser`) but live enablement/key choice remains operationally open; D7 remains open because no SSE exists; D4/D5 are now fully implemented, not merely contracts.
 - **Historical progress update (phase-era snapshot, superseded by the 2026-11-19 audit below):** 2026-11-17 — Phase 4A implemented and tested after explicit authorization, then **explicitly approved by the user on 2026-11-17** after confirming the tables were created in `fixit-test`. Added `.env.test.example`, `vitest.db.config.ts`, and `tests/db/{setup-db-env,helpers,guards.test,smoke.test}.ts`; wired `npm run test:db`; hardened `vitest.config.ts` so plain `npm test` stays DB-free. The fail-closed guard allows only the two exact `fixit-test` hosts, requires `RUN_DB_TESTS=1`, rejects production/development hosts, and never prints credentials. One-time `prisma migrate deploy` applied all four existing migrations to the isolated `fixit-test` project (PostgreSQL 18.7) only; enum, nullable columns, empty tables, migration history and a sentinel marker were verified. `npm test` 37/37 (DB-free), `npm run test:db` 15/15, typechecks and build pass. No application service, controller, route, validator, schema, migration or seed change; no development/production access; no staging or commit. Phase 3 remains approved and its record is preserved below. **Phase 4B was subsequently explicitly authorized by the user, implemented, tested, and explicitly approved by the user on 2026-11-19; it is APPROVED BY USER.** Phase 4B added `src/types/diagnosis.dto.ts`, `tests/db/diagnosis.integration.test.ts`, and `tests/docs/openapi.contract.test.ts`; modified the two diagnosis services, `src/docs/openapi.ts`, `tests/http/diagnosis.routes.test.ts`, `tests/db/helpers.ts`, and this file. Five APIs persisted sessions/messages with owner-scoped queries, explicit DTOs, a creation transaction and a conditional OPEN-state message write; at that time confirm/complete still returned 501 and were implemented later. `npm test` 56/56 (DB-free), `npm run test:db` 27/27 on `fixit-test` twice, typechecks, build and `prisma validate` pass. An initial transient DNS failure affected the first DB run; it resolved on retry. No schema, migration, seed, controller, route or validator change; no development/production access; no staging or commit. **Production knowledge promotion is still required:** development knowledge does not automatically exist in production.
 
@@ -636,7 +728,7 @@ in the 2026-11-19 audit addendum at the end of this file.
 | D4 | Explicit `FIXED` confirmation action form/contract (e.g. dedicated endpoint/flag) matched to pending challenge | **Resolved 2026-11-17 (Phase 3 contract)** | `POST /diagnosis/:id/confirm` with `{ challengeId }`; the challenge must be server-issued and checked against persisted state in a later phase. No client-provided verdict is accepted. Later implementation now issues a server-side UUID, stores only its SHA-256 hash, checks expiry/single use atomically, and sets `FIXED`. |
 | D5 | `NEEDS_PART` completion trigger (explicit end/ack action and/or deterministic no-further-in-app-action rule) | **Resolved 2026-11-17 (Phase 3 contract)** | `POST /diagnosis/:id/complete` with `{ acknowledged: true }`; deterministic no-further-action rule still belongs to Phase 7. Later implementation accepts completion only for backend-set `NEEDS_PART`, `TECHNICIAN_REQUIRED`, or `UNRESOLVED`. |
 | D6 | Initial parts provider enablement (`none` default vs specific provider/API key) | **Implementation mechanism resolved; operational choice still open** | Phase 8 is implemented with `PARTS_PROVIDER=none` as the safe default and opt-in `groq_browser`. Local/default is `none`; live `groq_browser` discovery and any production enablement/key choice remain UNVERIFIED and require separate authorization. |
-| D7 | Streaming priority (JSON-only MVP vs include SSE) | Open | Current implementation is JSON-only; `createChatCompletion` explicitly rejects streaming completions and no SSE utility/route exists. Any SSE work is a separate future scope decision. |
+| D7 | Streaming priority (JSON-only MVP vs include SSE) | Open | Current implementation is JSON-only; the optional Groq parts helper `createChatCompletion` explicitly rejects streaming completions and no SSE utility/route exists. Any SSE work is a separate future scope decision. |
 | D8 | CORS and/or basic rate limiting in-scope | **Resolved 2026-11-17 (Phase 3 scope); later extended** | Minimal CORS was implemented in Phase 3 and remains approved. Phase 9 later added a strict browser-origin allowlist and in-memory per-process rate limiting; the multi-instance/edge-limiter choice remains an operational gap. |
 | D9 | Test database strategy | **Resolved 2026-11-17** | No database access in Phase 2. Phase 4A uses a separate, isolated Neon project `fixit-test` (PostgreSQL 18.7), **not** a child branch of the development project, avoiding knowledge contamination. Four migrations were deployed and verified there; development and production were untouched. |
 | D10 | Symptom-based diagnosis knowledge strategy | **Resolved 2026-11-16 — option C (hybrid)** | MVP uses approved error-code knowledge with symptom-based questioning and candidate narrowing. AI candidate codes are hypotheses, never confirmed diagnoses; the backend validates candidates against applicable knowledge before any repair instructions. A dedicated reviewed symptom/cause knowledge model may be added later if needed. |
@@ -664,8 +756,10 @@ actually contains now. Status labels are: **IMPLEMENTED**, **TESTED**, **APPROVE
 The stale statements “Phases 5–9 NOT STARTED”, “confirm/complete return 501”, “rate limiting
 deferred”, and the 56/27 phase-era test counts in older records are preserved as historical
 snapshots but are superseded by this table and the tracker at the top of the roadmap. The
-current DB-free suite is 171/171 in 12 files; DB integration is recorded as 32/32 in 3 files
-but was not rerun for the latest forced-tool fallback change.
+audit-time DB-free suite was 171/171 in 12 files; DB integration was recorded as 32/32 in 3 files
+and was not rerun for the latest forced-tool fallback change. The current post-Phase-10A.4
+results are 294/294 DB-free in 18 files and 44/44 DB integration in 4 files, as recorded in §7
+and the persistent tracker.
 
 ### Complete approved implementation checklist (Phases 1–9)
 
@@ -758,11 +852,293 @@ Deviations, later implementation details, and current status are recorded separa
 | 7 | IMPLEMENTED; TESTED; no explicit phase approval recorded | `src/services/diagnosis.service.ts`; `src/services/ai/orchestrator.ts`; `src/routes/diagnosis.routes.ts`; `tests/services/{orchestrator,diagnosis.service}.test.ts`; DB confirm/complete tests | Runtime use of existing AI metadata migration; no new migration in this audit | 2026-11-19 audit: `npm test` 171/171; typechecks/build pass; DB suite previously 32/32 | Idempotency, safety overrides, challenges, confirm/complete, and provider-outside-transaction tests pass | Forced-tool fallback is narrowly mocked; live activation not proven | D4, D5 | No |
 | 8 | PARTIALLY IMPLEMENTED; no explicit phase approval recorded | `src/services/parts.service.ts`; `src/config/env.schema.ts`; `tests/services/parts.service.test.ts`; `README.md` | None | 2026-11-19 audit: `npm test` 171/171; typechecks/build pass | Mocked tests pass; live discovery not run | `PARTS_PROVIDER=none` default; `groq_browser` UNVERIFIED; install-safety field and factory layout absent | D6 operational enablement still open | No |
 | 9 | PARTIALLY IMPLEMENTED; hardening/docs TESTED; no explicit phase approval recorded | `src/middleware/{cors,rateLimit}.ts`; `src/utils/aiDiagnostics.ts`; `src/docs/openapi.ts`; `tests/docs/openapi.contract.test.ts`; `tests/http/app.test.ts` | None | 2026-11-19 audit: `npm test` 171/171; typechecks/build pass | CORS, rate-limit, and docs contract tests pass; SSE not tested because absent | JSON-only; streaming explicitly rejected; in-memory limiter is single-process | D7 open; D8 later extended beyond minimal Phase 3 CORS | No |
+| 10A.1 | APPROVED BY USER (2026-11-20); IMPLEMENTED; TESTS PASSED | Created `src/validators/appliance.validator.ts`, `src/types/appliance.dto.ts`, `tests/validators/appliance.validator.test.ts`, `tests/types/appliance.dto.test.ts`; modified `src/validators/diagnosis.validator.ts` (exported the existing `paginationSchema` for reuse) | None — no schema, migration, seed, Prisma client regeneration, or database access | Focused validator/DTO run 37/37; `npm test` 208/208 in 14 DB-free files; `npm run typecheck` pass; `npm run typecheck:test` pass; `git diff --check` pass (only the pre-existing `core.autocrlf` LF→CRLF normalization warning) | 37 new DB-free tests; no database, Groq, or live AI calls | Strictly validation/DTO boundary only; no service, controller, route, mount, DB operations, or future-phase work; no development/production access; no staging or commit | — | Yes — Phase 10A.1 explicitly approved by user on 2026-11-20 after review |
+| 10A.2 | APPROVED BY USER (2026-11-20); IMPLEMENTED; TESTS PASSED | Created `src/services/appliance.service.ts`, `tests/services/appliance.service.test.ts`; implementation modified no existing file (this `CONTEXT.md` record added after approval) | None — no schema, migration, seed, Prisma client regeneration, or database access; relied on the existing `DiagnosisSession.applianceId` `ON DELETE SET NULL` relation | Focused appliance service run 25/25; `npm test` 233/233 in 15 DB-free files; `npm run typecheck`, `npm run typecheck:test`, `npm run build` pass after an initial typecheck failure from a Zod-inferred type quirk was fixed in the service with locally derived input types; `git diff --check` pass (only pre-existing `core.autocrlf` warnings) | 25 new DB-free mocked-Prisma tests; no database, Groq, or live AI calls; read-only user review returned PASS on all seven review areas with no defects | Service-only phase: no routes, controllers, `app.ts` mount, HTTP tests, CORS/rate-limit, OpenAPI, DB tests, schema/migration, AI/prompt, OCR or frontend work. No failures in final verification runs; no staging or commit. | — | Yes — Phase 10A.2 explicitly approved by user on 2026-11-20 after implementation report and read-only review |
+| 10A.3 | APPROVED BY USER (2026-11-20); IMPLEMENTED; DB-FREE TESTS PASSED; MANUAL CRUD VERIFIED | Created `src/controllers/appliance.controller.ts`, `src/routes/appliance.routes.ts`, `tests/controllers/appliance.controller.test.ts`, `tests/docs/appliance.openapi.test.ts`, `tests/http/appliance.routes.test.ts`; modified `src/app.ts`, `src/middleware/cors.ts`, `src/docs/openapi.ts` | None — no schema, migration, seed, Prisma client regeneration, or database access; CORS method advertisement widened only to the methods the new endpoints require; docs opt-in unchanged | Focused controller/HTTP/OpenAPI run 61/61; `npm test` 294/294 in 18 DB-free files; `npm run typecheck`, `npm run typecheck:test`, `npm run build` pass; `git diff --check` pass (only `core.autocrlf` warnings) | 61 new DB-free mocked-service tests; no database, Groq, or live AI calls; user manually verified POST, GET list, GET one, PATCH and DELETE against the running app | DB integration tests not run; initial docs-test assertions expected inline enums instead of `$ref`s and were corrected before the final green run; no source/test/schema/env change for this documentation update | — | Yes — Phase 10A.3 explicitly approved by user on 2026-11-20 after implementation report and manual CRUD testing |
+| 10A.4 | APPROVED BY USER (2026-11-20); IMPLEMENTED; REAL DB TESTS PASSED; READ-ONLY REVIEW PASSED | Created `tests/db/appliance.integration.test.ts`; modified no source, test, config, schema, migration, or documentation file | None — no schema, migration, seed, Prisma client regeneration, service/controller/route/validator/DTO change; DB operations only on isolated `fixit-test` after the fail-closed guard passed; cleanup limited to fixture users created by this file | Credential-free guard verification PASS (exact `fixit-test` allowlist, `RUN_DB_TESTS=1`, `NODE_ENV=test`, no URL/credential printed); focused `npm run test:db -- tests/db/appliance.integration.test.ts` 12/12 after a test-only `confdeltype::text` cast; `npm run test:db` 44/44 in 4 files; `npm test` 294/294 in 18 DB-free files; `npm run typecheck`, `npm run typecheck:test`, `npm run build` pass; `git diff --check` pass with only pre-existing `core.autocrlf` warnings | 12 new real PostgreSQL integration tests; full DB suite 44/44; final read-only review PASS on all 10 areas with no blocking defects | Initial test-only raw-query deserialization issue fixed with a `::text` cast; no application defect found; non-blocking `pg` SSL-mode deprecation warning persists; no staging or commit | — | Yes — Phase 10A.4 explicitly approved by user on 2026-11-20 after implementation report and final read-only review |
+
+### Phase 10A.1 implementation & approval record (2026-11-20)
+
+**Status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-20)**. All earlier phase
+approval history and roadmap decisions remain unchanged.
+
+**Authorized scope:** the Appliance API's request-validation and response-DTO boundary only.
+No service, controller, routes, `app.ts` mount, Prisma operations, database tests, migrations,
+schema changes, seed changes, CORS/rate-limit changes, OpenAPI documentation, AI/prompt changes,
+or frontend/OCR work was performed.
+
+**Files created:**
+- `src/validators/appliance.validator.ts`
+- `src/types/appliance.dto.ts`
+- `tests/validators/appliance.validator.test.ts`
+- `tests/types/appliance.dto.test.ts`
+
+**Files modified:**
+- `src/validators/diagnosis.validator.ts` — exported the existing `paginationSchema` (one-line
+  change plus a comment) so appliance list validation reuses the same defaults and bounds
+  without a second pagination implementation.
+
+**Validator design:** create requires a `category` constrained by the generated Prisma
+`ApplianceCategory` enum and a trimmed `brand` of 1–120 characters; optional/nullable
+`modelNumber` (max 80) and `nickname` (max 100) are trimmed, normalize blank input to `null`,
+and preserve explicit `null`. Raw values are checked for control characters, including NUL,
+before trimming. Unknown keys, `id`, `userId` and server-managed fields are stripped by Zod's
+default object behavior. PATCH reuses the same field definitions with all editable fields
+optional and a refine that rejects empty or unknown-only bodies. `applianceIdParamSchema`
+uses `z.uuid` with an `id` path compatible with the existing validation-error middleware;
+`listAppliancesQuerySchema` reuses the exported pagination schema (`page=1`, `limit=20`,
+`1 <= page`, `1 <= limit <= 100`). No new packages were installed.
+
+**DTO design:** `applianceDtoSelect` selects only `id`, `category`, `brand`, `modelNumber`,
+`nickname`, `createdAt`, `updatedAt`; `toApplianceDto` maps those fields explicitly and never
+includes `userId` or a raw Prisma record. `PaginatedApplianceDto` aliases the existing generic
+`PaginatedDto` through a type-only import, adding no new pagination implementation.
+
+**Tests added (37, all DB-free):** valid create input; missing required fields; invalid
+category; empty brand; brand/modelNumber/nickname length boundaries; whitespace trimming;
+empty optional strings normalized to `null`; explicit `null`; NUL and other control-character
+rejection; unknown-key stripping; `userId` and `id` injection attempts; single- and
+multi-field PATCH; empty and unknown-only PATCH rejection; PATCH normalization and server-field
+stripping; valid and invalid appliance UUIDs with the expected issue path; pagination defaults,
+boundaries and invalid values; DTO mapping of every public field; no `userId` exposure;
+select/mapper key alignment; and nullable values preserved as `null`.
+
+**Commands and results:**
+- Focused `npx vitest run` on the two new test files — 2 files, 37/37 passed.
+- `npm test` — 14 files, 208/208 passed (37 new; no existing test changed).
+- `npm run typecheck` — passed.
+- `npm run typecheck:test` — passed.
+- `git diff --check` — passed; the only output was the pre-existing `core.autocrlf=true`
+  LF→CRLF normalization warning for the one modified tracked file.
+
+**Database impact:** none. Phase 10A.1 was DB-free: no schema, migration, seed, Prisma client
+regeneration, development database, test database, or production database was touched.
+
+**Issues/deviations:** the only change outside the four new files is the additive,
+behavior-preserving `paginationSchema` export described above. No failures or new dependencies.
+
+**User approval:** Yes — Phase 10A.1 was explicitly approved by the user on 2026-11-20 after
+review. At that time Phase 10A.2, 10A.3, 10A.4 and Phase 10B were PENDING and unauthorized;
+see the tracker and the Phase 10A.2/10A.3 records below for current status.
+
+### Phase 10A.2 implementation & approval record (2026-11-20)
+
+**Status:** IMPLEMENTED; TESTS PASSED; **APPROVED BY USER (2026-11-20)**. All earlier phase
+approval history and roadmap decisions remain unchanged.
+
+**Authorized scope:** the authenticated appliance service layer only — create, list, retrieve,
+update and delete appliances owned by the caller. No routes, controllers, `app.ts` mount, HTTP
+tests, CORS/rate-limit changes, OpenAPI, DB integration tests, schema/migration, seed, AI/prompt,
+OCR or frontend work was performed.
+
+**Files created:**
+- `src/services/appliance.service.ts`
+- `tests/services/appliance.service.test.ts`
+
+**Files modified:** none by the implementation. The pre-existing Phase 10A.1 validator, DTO,
+their tests and the `paginationSchema` export were left untouched. This `CONTEXT.md` file was
+updated after approval only to record status and results.
+
+**Service design:**
+- `createAppliance(userId, input)` sets `userId` only from the server argument, copies only the
+  four validated editable fields, normalizes omitted nullable fields to `null`, and returns
+  `applianceDtoSelect`/`toApplianceDto` output — never a raw Prisma record.
+- `listAppliances(userId, query)` scopes `where` to `{ userId }`, orders
+  `[{ createdAt: 'desc' }, { id: 'desc' }]`, reuses the shared validated `paginationSchema`
+  through `ListAppliancesQuery`, runs `findMany` and `count` in one `$transaction`, and returns
+  the standard `toPaginatedDto` metadata.
+- `getApplianceById(userId, params)` uses an owner-scoped `findFirst` and one identical
+  `APPLIANCE_NOT_FOUND` 404 for missing and foreign-owned ids.
+- `updateAppliance(userId, params, input)` uses a single conditional owner-scoped Prisma 7 write
+  (`update({ where: { id, userId }, ... })`), supported by the generated
+  `ApplianceWhereUniqueInput` that permits `userId` as an extra filter alongside required `id`.
+  Fields are copied individually: omitted fields are untouched, explicit `null` clears nullable
+  fields, and `id`/`userId`/timestamps never reach Prisma. P2025 maps to the same client-safe
+  404; other errors are rethrown to the central handler.
+- `deleteAppliance(userId, params)` issues one conditional owner-scoped `appliance.delete` and
+  returns `void`, consistent with other void-returning mutating services. It hard-deletes only
+  the Appliance row and relies entirely on the existing `DiagnosisSession.applianceId`
+  `ON DELETE SET NULL` relation; it neither touches diagnosis sessions/messages nor simulates a
+  cascade or introduces soft deletion.
+- Service-level input types are derived from the approved validator types because Zod's transform
+  on optional text fields infers those keys as required-but-possibly-undefined; this avoided any
+  change to Phase 10A.1 files.
+
+**Tests added (25, all DB-free):** server-derived `userId` and validated-field persistence on
+create; public DTO mapping with no `userId` or extra record data; forged `id`/`userId`/timestamp
+stripping; nullable field normalization; owner-scoped list filtering, stable ordering, exact
+pagination arguments and metadata, empty result, no cross-user data; owner-scoped lookup with
+success, missing and foreign-owned 404; owner-scoped conditional update with omitted fields
+preserved, explicit `null` clearing, server-managed fields blocked, P2025 and foreign-owner 404;
+owner-scoped conditional delete with no session/message deletion or manual cascade; and
+propagation of unexpected Prisma failures instead of wrapping them.
+
+**Commands and results:**
+- Focused `npx vitest run tests/services/appliance.service.test.ts` — 1 file, 25/25 passed.
+- `npm test` — 15 files, 233/233 passed (25 new; no existing test changed).
+- `npm run typecheck`, `npm run typecheck:test`, `npm run build` — passed after the initial
+  Zod-inferred type failure described above was fixed in the service; all three were rerun green.
+- `git diff --check` — passed; the only output was the pre-existing `core.autocrlf` LF→CRLF
+  normalization warnings for the two Phase 10A.1 tracked files.
+
+**Database impact:** none. Phase 10A.2 was DB-free: no schema, migration, seed, Prisma client
+regeneration, or development/test/production database access. At that time the existing migration
+already declared `ON DELETE SET NULL`, while live enforcement verification remained Phase 10A.4;
+Phase 10A.4 completed and approved that verification on 2026-11-20.
+
+**Issues/deviations:** none from the approved plan. An initial typecheck/typecheck:test/build
+failure caused by the Zod inference quirk was resolved in the service before final verification;
+no final failures, no new dependencies, no staging or commit. A separate read-only review scored
+PASS on all seven review areas and found no concrete defects (only optional extra test coverage
+for multi-page metadata and an explicit `appliance.deleteMany` not-called assertion).
+
+**User approval:** Yes — Phase 10A.2 was explicitly approved by the user on 2026-11-20 after the
+implementation report and read-only review. At that time Phase 10A.3, 10A.4 and Phase 10B were
+PENDING and unauthorized; see the Phase 10A.3 record below for current status.
+
+### Phase 10A.3 implementation & approval record (2026-11-20)
+
+**Status:** IMPLEMENTED; DB-FREE TESTS PASSED; MANUAL APPLIANCE CRUD VERIFIED BY USER;
+**APPROVED BY USER (2026-11-20)**. All earlier phase approvals and roadmap decisions remain
+unchanged.
+
+**Authorized scope:** expose the approved appliance service through authenticated HTTP endpoints:
+controller, router, `app.ts` mount, CORS method advertisement, OpenAPI documentation, and DB-free
+controller/HTTP/contract tests. No database integration tests, schema/migration, seed, service or
+validator/DTO changes, AI/OCR/frontend work, new dependency or environment variable, or staging
+and commit was in scope.
+
+**Files created:**
+- `src/controllers/appliance.controller.ts`
+- `src/routes/appliance.routes.ts`
+- `tests/controllers/appliance.controller.test.ts`
+- `tests/docs/appliance.openapi.test.ts`
+- `tests/http/appliance.routes.test.ts`
+
+**Files modified:**
+- `src/app.ts` — mounted `applianceRouter` at `/appliances` alongside the existing routers.
+- `src/middleware/cors.ts` — advertised `PATCH` and `DELETE` in `Access-Control-Allow-Methods`;
+  the browser-origin allowlist, allowed headers, preflight behavior, and max-age are unchanged.
+- `src/docs/openapi.ts` — documented all five operations, their bearer-auth requirements, request
+  bodies, pagination/UUID parameters, envelope-wrapped DTOs, success codes, validation/auth errors,
+  and shared `APPLIANCE_NOT_FOUND` 404 behavior.
+
+**HTTP design:** all five routes require `requireAuth` before validation. Write routes use one
+shared `rateLimit` instance named `appliance-write`, keyed by authenticated user id and bounded by
+the existing `RATE_LIMIT_AUTH_MAX`; GET routes are not rate limited. Controllers use the existing
+`currentUserId(req)` pattern, pass only validated data to the Phase 10A.2 service, contain no
+Prisma queries, and use `sendSuccess`/`next(error)`. Delete honors the service's `Promise<void>`
+convention with the standard `{ message: 'Appliance deleted' }` data payload. No `userId` or
+internal database detail is exposed.
+
+**Tests added (61, all DB-free):** authentication on all five routes, auth-before-validation,
+validated create/list/get/update/delete delegation and responses, invalid body/query/UUID errors,
+identical 404 responses for missing and foreign-owned appliances, write rate limiting on POST/PATCH/
+DELETE, unthrottled reads, CORS method advertisement and origin rejection, and full appliance
+OpenAPI contract coverage. The service is mocked at the HTTP/controller boundary; no real database
+is contacted.
+
+**Manual verification:** the user manually tested the running API and confirmed that POST
+`/appliances`, GET `/appliances`, GET `/appliances/:id`, PATCH `/appliances/:id`, and DELETE
+`/appliances/:id` all work.
+
+**Commands and results:** focused controller/HTTP/OpenAPI run 61/61 passed; `npm test` 294/294 in
+18 DB-free files; `npm run typecheck`, `npm run typecheck:test`, and `npm run build` passed;
+`git diff --check` passed with only pre-existing `core.autocrlf` normalization warnings.
+
+**Database impact:** none. Phase 10A.3 was DB-free: no schema, migration, seed, Prisma client
+regeneration, development database, test database, or production database access. At that time,
+appliance database integration tests, including live `ON DELETE SET NULL` verification, remained
+**Phase 10A.4 and had not been run**; Phase 10A.4 completed them on 2026-11-20 (see below). The
+standing safety rules remain: `fixit-development-preserved` is the development database;
+integration tests must use isolated `fixit-test` with the existing exact host allowlist and
+`RUN_DB_TESTS=1`; production must never be accessed or modified.
+
+**Issues/deviations:** no material deviation. An initial docs-test assertion expected inline enums
+instead of `$ref`s and was corrected before the final green run. No new dependencies, environment
+variables, staging, or commit.
+
+**User approval:** Yes — Phase 10A.3 was explicitly approved by the user on 2026-11-20 after the
+implementation report and successful manual Appliance CRUD testing. At that time Phase 10A.4 and
+Phase 10B were PENDING and unauthorized; Phase 10A.4 is now approved below, while Phase 10B,
+Phase 11 and Phase 12 remain PENDING.
 
 All phase implementation records below are historical snapshots of what was true when each
 phase was completed and approved. Current status is recorded in the persistent tracker, the
-2026-11-19 audit correction, and section 12; later implementation may have superseded temporary
-stubs, deferred settings, and phase-era test counts without changing those historical approvals.
+2026-11-19 audit correction, the Phase 10A.1, 10A.2, 10A.3 and 10A.4 records above, and section 12;
+later implementation may have superseded temporary stubs, deferred settings, and phase-era test
+counts without changing those historical approvals.
+
+### Phase 10A.4 implementation & approval record (2026-11-20)
+
+**Status:** IMPLEMENTED; REAL DB TESTS PASSED; FINAL READ-ONLY REVIEW PASSED;
+**APPROVED BY USER (2026-11-20)**. All earlier phase approvals and roadmap decisions remain
+unchanged.
+
+**Authorized scope:** real Prisma/PostgreSQL integration tests for Appliance CRUD against the
+isolated `fixit-test` database only, reusing the existing DB test setup, guards, helpers and
+cleanup conventions. No schema, migration, seed, service, controller, route, validator, DTO,
+AI/OCR, frontend, configuration or environment change was in scope.
+
+**Files created:**
+- `tests/db/appliance.integration.test.ts`
+
+**Files modified:** none by Phase 10A.4. Application code, tests other than the new DB file,
+schema, migrations, `.env*`, configuration and documentation were left untouched by the
+implementation; this `CONTEXT.md` update only records the completed/approved status.
+
+**Database safety verification before any DB operation:** the existing fail-closed guard in
+`tests/db/setup-db-env.ts` was imported through a credential-free check. It required
+`RUN_DB_TESTS=1`, rejected `NODE_ENV=production`, loaded only `.env.test`, validated both pooled
+and direct `TEST_*` hosts against the exact `fixit-test` allowlist, and confirmed matching
+database names. The check reported `guard: PASS`, project identity `fixit-test`, no URL printed,
+and no credentials printed. No connection was opened by that check.
+
+**Tests added (12, real Prisma/PostgreSQL):** create/persistence with server-derived `userId`,
+generated UUID, forged field stripping, nullable defaults and explicit nullable values;
+two-user ownership isolation for list/get/update/delete with owner-scoped counts and identical
+`APPLIANCE_NOT_FOUND` behavior; deterministic `createdAt DESC, id DESC` ordering with a
+timestamp tie, page boundaries, beyond-last-page empty result, and owner-scoped totals; partial
+update preserving omitted fields, explicit `null` clearing, all editable fields, and a fixed old
+`updatedAt` proving the schema-managed update; deletion with a real `DiagnosisSession` and
+`Message`, PostgreSQL `pg_constraint` verification of `ON DELETE SET NULL`, session and message
+preservation with `applianceId: null`, and no change to another user's records; and Supertest
+CRUD plus foreign-owner 404 parity through the real mounted `/appliances` routes using real
+bearer tokens.
+
+**Isolation and cleanup:** each test creates unique users via `createTestUser()` and tracks only
+those IDs in a file-local array. `afterEach` calls `deleteTestUsers()` on that exact list, so
+cascades can only remove rows created by this file; no broad `deleteMany`, truncate, or
+unfiltered write is used. `beforeEach` resets rate-limit state and `afterAll` disconnects
+Prisma. The full DB suite's empty-table smoke checks still pass.
+
+**Commands and results:**
+- Credential-free guard verification — PASS (`fixit-test` identity; exact allowlist; no URL or
+  credential printed).
+- `npm run test:db -- tests/db/appliance.integration.test.ts` — 12/12 passed after one test-only
+  raw-query fix (`confdeltype::text` cast for PostgreSQL `char` deserialization).
+- `npm run test:db` — **44/44 in 4 files** against isolated `fixit-test`.
+- `npm test` — **294/294 in 18 DB-free files**.
+- `npm run typecheck`, `npm run typecheck:test`, `npm run build` — passed.
+- `git diff --check` — passed; only pre-existing `core.autocrlf` LF→CRLF warnings for earlier
+  tracked files.
+
+**Database impact:** test-row reads/writes only on isolated `fixit-test` after the guard passed;
+cleanup was limited to fixture users created by the new test file. No schema, migration, seed,
+Prisma client regeneration, development database, or production database was touched.
+
+**Issues/deviations:** the initial focused run exposed a test-only raw-query deserialization
+issue, fixed with a `::text` cast; no application defect was found and no source change was
+needed. A non-blocking `pg` SSL-mode deprecation warning persists. No new dependency,
+environment variable, staging, commit, or deployment occurred.
+
+**Final read-only review:** all 10 requested review areas returned PASS; no blocking defects were
+found. Optional non-blocking improvements were noted (locale-independent comparator, stronger
+`toBeDefined()` assertions, schema-qualified FK query), but none require changes before approval.
+
+**User approval:** Yes — Phase 10A.4 was explicitly approved by the user on 2026-11-20 after the
+implementation report and final read-only review. Phase 10B — AI Appliance Identity Hardening
+has not been started and requires separate explicit authorization.
 
 ### Phase 1 implementation & application record (2026-11-16)
 
@@ -1190,23 +1566,43 @@ or secret exposure occurred. A prior Groq key that may have appeared in an earli
 must be treated as exposed and rotated if that transcript is considered shared; no key value is
 recorded here.
 
+A later 2026-11-20 documentation-only progress update also changed only
+`fixit-backend/CONTEXT.md`: it persisted Phase 10A.1–10A.4 approvals, the Phase 10A.4 database
+integration results, successful manual Appliance CRUD from Phase 10A.3, and Phase 10B as the next
+pending phase. No source, test, schema, migration, configuration, environment file, database
+record, or git history was changed by that update.
+
+A 2026-11-23 documentation-only progress update likewise changed only
+`fixit-backend/CONTEXT.md`: it records the Gemini diagnosis decision (with Groq retained for
+optional browser-based parts search), manual Swagger diagnosis/`complete` safety checks, the
+pending real-knowledge `/confirm` verification decision, verified appliance model-scope
+behavior, the 2026-11-23 verification results, and the agreed documentation/OCR-planning next
+direction. No source, test, schema, migration, configuration, environment file, database record,
+knowledge record, approval status, or git history was changed by this update. Pre-existing
+uncommitted work was left untouched.
+
 ### 12.2 Verified current implementation boundaries
 
 - All seven diagnosis routes (`POST/GET /diagnosis`, `GET /diagnosis/:id`,
   `GET/POST /diagnosis/:id/messages`, `/confirm`, `/complete`) are implemented; no `501`
   `NOT_IMPLEMENTED` remains in live source.
-- Diagnosis requires an existing, owned `Appliance`. There are **no** `/appliances` CRUD routes
-  anywhere in source, OpenAPI, or tests.
+- Historical audit boundary (as of 2026-11-19): diagnosis required an existing, owned
+  `Appliance`, and there were **no** `/appliances` CRUD routes in source, OpenAPI, or tests at
+  that time. Phase 10A.3 later implemented and manually verified those routes; Phase 10A.4 added
+  real database integration tests.
 - No backend OCR, image-upload, vision, or multipart service exists. `appliance-scan.service.ts`
   is a zero-byte placeholder.
 - The Expo app is SDK 58 with real static home/camera screens, but no API client, auth token
   storage, appliance screen, diagnosis screens, confirm/complete UI, OCR, or parts UI. The `scan`
   screen captures/picks locally and has an explicit upload TODO.
-- OpenAPI documents the live health, auth, and diagnosis endpoints only. Swagger is opt-in via
-  `ENABLE_API_DOCS`.
+- Historical audit boundary: OpenAPI documented the live health, auth, and diagnosis endpoints
+  only. Phase 10A.3 added appliance paths; Swagger remains opt-in via `ENABLE_API_DOCS`.
 - Rate limiting is present but in-memory and per-process. SSE/streaming is absent.
 
 ### 12.3 Groq final-round reliability record
+
+This subsection preserves the earlier Groq diagnosis investigation as history. Diagnosis now
+uses Gemini (see §1 and §9); Groq remains relevant only to optional browser-based parts search.
 
 The repository contains the prior final-round reliability fix: the system prompt requires the
 structured final tool even when information is insufficient, and the orchestrator forces
@@ -1232,22 +1628,32 @@ Limitations are explicit:
 
 ### 12.4 Unresolved and unverified items
 
-1. **Phase approvals:** Phases 1–4B retain explicit historical approvals. No explicit user
-   approval is recorded for Phases 5–9, regardless of implementation or passing tests.
-2. **Groq fallback:** not live-activation-verified; HTTP 200 with no tool call remains an
-   unresolved safe-error path.
+1. **Phase approvals:** Phases 1–4B and 10A.1–10A.4 retain explicit historical approvals. No
+   explicit user approval is recorded for Phases 5–9, regardless of implementation or passing
+   tests.
+2. **Gemini fallback:** not live-activation-verified; HTTP 200 with no tool call remains an
+   unresolved safe-error path. Groq tool-calling troubleshooting for diagnosis was unsuccessful;
+   Groq remains the optional browser-based parts provider, not a diagnosis provider.
 3. **Parts provider:** `PARTS_PROVIDER=none` is the default; `groq_browser` is unit-tested but
    externally UNVERIFIED. Production enablement remains a separate decision.
-4. **DB suite:** last recorded 32/32, not rerun after the fallback change. If rerun, it must
-   remain isolated to the exact `fixit-test` allowlist with `RUN_DB_TESTS=1`.
+4. **DB suite:** Phase 10A.4 added 12 appliance integration tests; the full suite passed
+   **44/44 in 4 files** on 2026-11-20 against isolated `fixit-test`. The prior 32/32 baseline was
+   not rerun after the fallback change or Phases 10A.1–10A.3. Any future DB run must use isolated
+   `fixit-test` with the exact allowlist and `RUN_DB_TESTS=1`; development is
+   `fixit-development-preserved` and production must never be accessed or modified.
 5. **Production knowledge/readiness:** the approved development knowledge promotion has not
    been applied or verified in production. Production readiness remains blocked pending a
    separate controlled review and explicit authorization.
 6. **Phase 9:** streaming/SSE absent; D7 remains open; rate limiting is not distributed.
-7. **Appliance CRUD/OCR/frontend:** all are future work only, with no implementation in this
-   task.
-8. **Confirm/complete regression:** backend unit/DB/validation coverage exists, but live
-   frontend or end-to-end lifecycle testing does not.
+7. **Appliance CRUD/OCR/frontend:** Phases 10A.1 (validation/DTO), 10A.2 (service), 10A.3
+   (controllers/routes/HTTP) and 10A.4 (isolated DB integration) are implemented, tested and
+   APPROVED BY USER (2026-11-20); the user manually verified all five CRUD operations. Phase 10B
+   (AI appliance identity hardening), Phase 11 (OCR) and Phase 12 (frontend) remain pending and
+   unauthorized.
+8. **Confirm/complete regression:** `/complete` was manually verified through Swagger and
+   preserved the backend-set `TECHNICIAN_REQUIRED` verdict. Real-knowledge `/confirm`
+   end-to-end testing remains pending (§9); the terminal technician-required session lifecycle
+   and live frontend lifecycle testing have not been fully investigated.
 
 ### 12.5 Future phases added by this audit (not part of the original approved Phases 1–9)
 
@@ -1256,7 +1662,12 @@ the approved plan above.
 
 #### Phase 10 — Authenticated Appliance CRUD
 
-- **Status:** PENDING; NOT STARTED; no authorization in this document.
+- **Status:** Phase 10A.1 validation/DTO, Phase 10A.2 service, Phase 10A.3 controllers/routes/
+  HTTP and Phase 10A.4 isolated DB integration are IMPLEMENTED, TESTED and **APPROVED BY USER
+  (2026-11-20)** (see their records above); the user manually verified all five CRUD operations
+  and Phase 10A.4 passed 12 real PostgreSQL tests. The next sub-phase is **Phase 10B — AI
+  Appliance Identity Hardening**, which is PENDING and unauthorized here. Phase 11 (OCR) and
+  Phase 12 (frontend) also remain PENDING.
 - **Objective:** let an authenticated user create, list, retrieve, update, and delete their own
   appliances without depending on test fixtures or direct Prisma writes.
 - **Dependencies:** Phase 1 `Appliance` schema; Phase 3 auth/route/validation patterns;
@@ -1270,7 +1681,20 @@ the approved plan above.
   `PATCH /appliances/:id`, and `DELETE /appliances/:id` are authenticated, Zod-validated,
   paginated where appropriate, DTO-filtered, owner-scoped, and OpenAPI-documented; non-owned
   ids produce the same 404 shape as missing ids; typechecks, DB-free tests, build, and
-  `git diff --check` pass; isolated DB tests pass only under the existing fail-closed guard.
+  `git diff --check` pass. These HTTP-layer criteria are met by Phase 10A.3; the isolated DB
+  integration criterion, including live `ON DELETE SET NULL` enforcement under the existing
+  fail-closed guard, was completed and approved in Phase 10A.4.
+
+#### Phase 10B — AI Appliance Identity Hardening
+
+- **Status:** PENDING; NOT STARTED; no authorization in this document.
+- **Objective:** harden backend-authoritative appliance identity handling after the approved
+  Phase 10A CRUD/DB foundation. Exact scope and decisions require explicit user authorization
+  and must be recorded before implementation.
+- **Dependencies:** Phase 10A.1–10A.4 are complete and approved. No AI appliance identity
+  hardening work has been performed in this repository.
+- **Acceptance criteria:** to be defined in the explicit authorization for that phase; do not
+  infer scope, files, tests, or approval from this roadmap entry.
 
 #### Phase 11 — OCR / sticker and error-code extraction
 
@@ -1279,13 +1703,18 @@ the approved plan above.
   needed for upload/storage provider (D11), OCR provider and confidence thresholds (D12),
   retention/deletion, and whether native modules require a development build. Any migration or
   storage change requires separate approval.
-- **Scope:** authenticated image upload, bounded file/size/type validation, OCR extraction of
-  brand/model/error-code candidates, confidence metadata, and a user-review/correction contract.
-  Existing local camera/gallery capture in the Expo app is not a backend implementation.
-- **Acceptance criteria:** uploads are authenticated, bounded, and never trusted as authoritative;
-  extracted fields require explicit user review before writing appliance data; no knowledge row
-  is approved automatically; secrets stay server-side; unsafe or low-confidence results are
-  labeled; tests cover invalid files, oversize input, extraction failure, and correction flow.
+- **Scope (simplified direction agreed 2026-11-23):** authenticated image upload, bounded
+  file/size/type validation, OCR extraction of **appliance error codes only**, and a
+  user-review/correction contract. Appliance brand and model will be provided manually by the
+  user. The earlier broader brand/model/error-code candidate extraction is a superseded planning
+  idea, not the current direction. Existing local camera/gallery capture in the Expo app is not
+  a backend implementation.
+- **Acceptance criteria (planning only, not approved implementation):** uploads are authenticated,
+  bounded, and never trusted as authoritative; extracted error codes require explicit user
+  review/correction before being sent into diagnosis; brand/model are not inferred by OCR; no
+  knowledge row is approved automatically; secrets stay server-side; unsafe or low-confidence
+  results are labeled; tests cover invalid files, oversize input, extraction failure, and
+  correction flow.
 
 #### Phase 12 — Frontend integration
 
@@ -1306,24 +1735,42 @@ the approved plan above.
 
 ### 12.6 Exact next implementation task
 
-The next implementation task is **Phase 10 — Authenticated Appliance CRUD**, and it is currently
-**PENDING explicit user authorization**. Do not begin it merely because this document records it.
+Current status: Phases 10A.1, 10A.2, 10A.3 and 10A.4 are complete and **APPROVED BY USER
+(2026-11-20)**, with user-confirmed manual Appliance CRUD and 12 passing real PostgreSQL
+appliance integration tests. Phase 10B — AI Appliance Identity Hardening, Phase 11 (OCR) and
+Phase 12 (frontend) remain **PENDING explicit user authorization**. Do not begin any of them
+merely because this document records them.
 
-When authorized, the exact task is:
+**Agreed next direction (2026-11-23), in order:**
 
-1. Re-read `prisma/schema.prisma`, `src/services/session.service.ts`,
-   `src/routes/diagnosis.routes.ts`, DTO/validator patterns, and `src/docs/openapi.ts`.
-2. Add owner-scoped appliance routes under `/appliances` using
-   `route → controller → service → Prisma`, Zod validation, explicit DTO selects, the existing
-   response envelope, and auth before validation.
-3. Implement create/list/get/update/delete without trusting client ownership fields; do not add
-   a migration or change the diagnosis/OCR/frontend code.
-4. Add DB-free HTTP/contract tests and, only with the existing isolated `fixit-test` guard,
-   integration tests for ownership, validation, update, and delete.
-5. Run `npm test`, `npm run typecheck`, `npm run typecheck:test`, `npm run build`,
-   `git diff --check`, and the isolated DB suite if authorized/configured.
-6. Update this `CONTEXT.md` with actual files, commands, results, status, and explicit approval
+1. Complete and review the backend sequence diagrams for authentication, appliance and diagnosis
+   flows, if not already completed.
+2. Plan the simplified OCR feature. OCR should extract **only appliance error codes** from
+   images. Appliance brand and model will be provided manually by the user. OCR results must be
+   reviewed or corrected by the user before being sent into diagnosis.
+3. OCR planning is the next feature direction only; OCR implementation has **not** been approved,
+   and this note does not approve Phase 10B, Phase 11, Phase 12 or any unapproved phase.
+
+When a future implementation task is authorized, the procedure is:
+
+1. Re-read this `CONTEXT.md`, inspect the working tree, and obtain explicit scope/decisions for
+   that task before changing any file.
+2. Implement only the explicitly authorized phase. Do not expand into schema/migrations, OCR,
+   frontend, unrelated refactoring, or later phases unless separately authorized.
+3. Do not add a dependency, environment variable, or database target without explicit approval.
+   Do not claim a test passed unless it was actually run.
+4. Run the verification commands specified by the authorization (normally `npm test`,
+   `npm run typecheck`, `npm run typecheck:test`, `npm run build`, and `git diff --check`); run
+   `npm run test:db` only if explicitly authorized and the exact `fixit-test` allowlist plus
+   `RUN_DB_TESTS=1` are satisfied.
+5. Update this `CONTEXT.md` with actual files, commands, results, status, and explicit approval
    state, then stop for user review. Do not commit, push, or deploy.
+
+**Database safety for future work:** `fixit-development-preserved` is the development database;
+integration tests must use the isolated `fixit-test` project with the exact existing host allowlist
+and `RUN_DB_TESTS=1`. Production must never be accessed or modified. Phase 10A.4 appliance
+database integration tests have passed (12 new tests; 44/44 full DB suite), but no Phase 10B work
+has been run.
 
 ### 12.7 Consolidated agent safety rules
 

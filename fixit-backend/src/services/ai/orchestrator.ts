@@ -1,4 +1,3 @@
-import type { Groq } from 'groq-sdk';
 import { ZodError } from 'zod';
 import { env } from '../../config/env.js';
 import { logAiToolFailure } from '../../utils/aiDiagnostics.js';
@@ -18,7 +17,6 @@ import {
   type PartsDto,
   type SubmitDiagnosisOutcome,
 } from '../../validators/ai.validator.js';
-import { createChatCompletion } from '../groq.service.js';
 import {
   collectKnowledgeCitations,
   extractCandidateCodes,
@@ -27,18 +25,31 @@ import {
   type ApprovedRepairSequence,
   type KnowledgeApplianceContext,
 } from '../knowledge.service.js';
-import { buildDiagnosisMessages } from './prompt.js';
+import {
+  hasTrustedModel,
+  toPersistedTrustedApplianceIdentity,
+  type TrustedApplianceIdentity,
+} from './appliance-identity.js';
+import {
+  createAiInteraction,
+  type AiFunctionCall,
+  type AiProviderResponse,
+  type AiStep,
+  type AiToolChoice,
+} from './provider.js';
+import { buildDiagnosisPrompt } from './prompt.js';
 import { diagnosisToolNames, diagnosisTools } from './tool-definitions.js';
 
 export type PartsSearchFn = (query: {
   brand: string;
   modelNumber: string;
+  modelSource: 'APPLIANCE' | 'USER_MESSAGE';
   component: string;
   partNumber?: string;
 }) => Promise<PartsDto>;
 
 export type OrchestratorInput = {
-  appliance: { category: 'WASHING_MACHINE' | 'REFRIGERATOR'; brand: string; modelNumber: string | null };
+  identity: TrustedApplianceIdentity;
   context: DiagnosisContextDto;
   history: readonly MessageDto[];
   userContent: string;
@@ -64,14 +75,125 @@ type ToolState = {
   repairSequence?: ApprovedRepairSequence;
 };
 
-const HAZARD_PATTERN =
-  /\b(main[s]?|mains|voltage|live wire|electrical panel|gas line|gas valve|refrigerant|sealed system|compressor replacement|open(?:ing)? (?:the )?panel|bypass|door lock bypass|disconnect the earth|capacitor)\b/i;
+// Backend-owned safety policy. Immediate danger and dangerous instructions are
+// detected separately from diagnostic component names. A speculative mention of
+// refrigerant, a sealed system, a capacitor or a compressor is never itself a
+// hazard; only explicit danger reports, assertive evidence, or instructions to
+// perform prohibited work trigger the stop-now override.
+function caseInsensitive(source: string): RegExp {
+  return new RegExp(source, 'gi');
+}
+
+const IMMEDIATE_HAZARD_PATTERNS: readonly RegExp[] = [
+  caseInsensitive(String.raw`\b(?:smoke|smoking|fire|flames?)\b`),
+  caseInsensitive(String.raw`\b(?:burning|charred|scorched|melted|melting|overheated|overheating)\b`),
+  caseInsensitive(String.raw`\b(?:sparks?|sparking|arcing)\b`),
+  caseInsensitive(String.raw`\b(?:electric(?:al)? shock|shocked|electrocuted|electrocution)\b`),
+  caseInsensitive(String.raw`\b(?:gas leak|gas smell|gas odou?r|smell(?:s|ed|ing)? (?:of|like) gas|rotten[- ]egg smell)\b`),
+  caseInsensitive(String.raw`\b(?:refrigerant leak|freon leak|coolant leak)\b`),
+  caseInsensitive(String.raw`\blive (?:wire|wiring|terminal)s?\b`),
+  caseInsensitive(String.raw`\bexposed\b[^.!?;,]{0,50}\b(?:mains|voltage|wires?|wiring|electrical|terminals?)\b`),
+  caseInsensitive(String.raw`\b(?:mains|voltage|wires?|wiring)\b[^.!?;,]{0,50}\bexposed\b`),
+];
+
+// Assertive model-generated evidence of danger, as opposed to a hypothesis such
+// as "possible refrigerant issue". Negated or hypothetical clauses are ignored.
+const ESTABLISHED_HAZARD_PATTERN = caseInsensitive(
+  String.raw`\b(?:there (?:is|are)|confirmed|evidence of|active|visible|found|detected|you have|i (?:can )?(?:see|smell|hear|notice))\b[^.!?;\n]{0,80}\b(?:smoke|fire|flames?|sparks?|arcing|burning smell|gas leak|gas odou?r|refrigerant leak|freon leak|exposed (?:live )?wires?)\b`,
+);
+
+const DANGEROUS_ACTION = String.raw`(?:check|test|measure|probe|inspect|open|remove|replace|charge|recharge|refill|top(?:ped|ping)?[\s-]?up|add|bypass|short|jump|bridge|disconnect|reconnect|adjust|repair|fix|install|handle|touch|unscrew|pry|service)`;
+const DANGEROUS_SUBJECT = String.raw`(?:mains|voltage|live (?:wire|wiring|terminal)s?|electrical panel|fuse box|circuit breaker|capacitor|refrigerant|freon|coolant(?: line)?|sealed system|gas line|gas valve|propane line|compressor|door lock|safety(?: device| switch| interlock| thermostat)?|earth wire|ground wire)`;
+
+// Repair instructions are validated on their own, not by broad keyword
+// matching: technician-only component names in a diagnosis are allowed, but
+// directing the user to work on them is not.
+const UNSAFE_INSTRUCTION_PATTERNS: readonly RegExp[] = [
+  caseInsensitive(String.raw`\b${DANGEROUS_ACTION}\w*\b[^.!?;\n]{0,70}\b${DANGEROUS_SUBJECT}\b`),
+  caseInsensitive(
+    String.raw`\b${DANGEROUS_SUBJECT}\b[^.!?;\n]{0,70}\b(?:tested|checked|measured|replaced|recharged|refilled|charged|bypassed|opened|handled|serviced|disconnected|repaired)\b`,
+  ),
+  caseInsensitive(
+    String.raw`\b(?:how (?:do|can|should) (?:i|we)|tell me how|can you (?:tell|show) me how|i want to|i (?:am going to|will|need to))\b[^.!?;\n]{0,80}\b${DANGEROUS_ACTION}\w*\b`,
+  ),
+];
+
+const NEGATION_PATTERN =
+  /\b(?:no|not|never|none|nothing|without|any|haven'?t|hasn'?t|hadn'?t|don'?t|doesn'?t|didn'?t|isn'?t|aren'?t|wasn'?t|weren'?t|can'?t|couldn'?t|won'?t|wouldn'?t)\b/i;
+
+// A clause mentioning a technician or a prohibition is not a DIY instruction.
+const SAFE_CONTEXT_PATTERN =
+  /\b(?:technician|qualified|professional|service (?:person|engineer|technician)|do not|don'?t|never|avoid|should not|shouldn'?t|must not|can'?t|cannot|won'?t|not safe|unsafe|leave (?:it|this) to|not (?:a|an) diy)\b/i;
+
+function safetyClauses(text: string): string[] {
+  return text
+    .split(/[.!?;\n,]+|\bbut\b|\bhowever\b|\balthough\b/i)
+    .map((clause) => clause.trim())
+    .filter((clause) => clause.length > 0);
+}
+
+function isNegatedBefore(clause: string, index: number): boolean {
+  return NEGATION_PATTERN.test(clause.slice(Math.max(0, index - 90), index));
+}
+
+function matchesAny(patterns: readonly RegExp[], clause: string): boolean {
+  for (const pattern of patterns) {
+    for (const match of clause.matchAll(pattern)) {
+      if (!isNegatedBefore(clause, match.index ?? 0)) return true;
+    }
+  }
+  return false;
+}
+
+function containsImmediateHazard(text: string): boolean {
+  return safetyClauses(text).some((clause) => matchesAny(IMMEDIATE_HAZARD_PATTERNS, clause));
+}
+
+function containsEstablishedHazard(text: string): boolean {
+  return safetyClauses(text).some(
+    (clause) => !SAFE_CONTEXT_PATTERN.test(clause) && matchesAny([ESTABLISHED_HAZARD_PATTERN], clause),
+  );
+}
+
+function containsUnsafeInstruction(text: string): boolean {
+  return safetyClauses(text).some(
+    (clause) => !SAFE_CONTEXT_PATTERN.test(clause) && matchesAny(UNSAFE_INSTRUCTION_PATTERNS, clause),
+  );
+}
+
+type SafetySignals = {
+  immediateHazard: boolean;
+  unsafeInstructions: boolean;
+};
+
+function classifySafety(
+  input: OrchestratorInput,
+  final: SubmitDiagnosisOutcome,
+  knowledgeRepairSteps: KnowledgeDto['repairSteps'],
+): SafetySignals {
+  // Only the current and prior USER turns are reports of real conditions.
+  // Assistant history and diagnosticFacts are advisory model hypotheses.
+  const userText = [
+    input.userContent,
+    ...input.history.filter((message) => message.role === 'USER').map((message) => message.content),
+  ].join(' ');
+  const modelText = [final.reply, ...(final.diagnosticFacts ?? [])].join(' ');
+  const stepText = knowledgeRepairSteps.map((step) => step.instruction).join(' ');
+
+  return {
+    immediateHazard: containsImmediateHazard(userText) || containsEstablishedHazard(modelText),
+    unsafeInstructions:
+      containsUnsafeInstruction(userText) ||
+      containsUnsafeInstruction(modelText) ||
+      containsUnsafeInstruction(stepText),
+  };
+}
 
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 3)}...`;
 }
 
-type ToolCallLike = { function?: { name?: unknown } };
+type ToolCallLike = Pick<AiFunctionCall, 'name'>;
 
 function logToolFailure(
   reason: string,
@@ -86,7 +208,7 @@ function logToolFailure(
   logAiToolFailure({
     reason,
     round: details.round + 1,
-    toolName: details.calls?.[0]?.function?.name,
+    toolName: details.calls?.[0]?.name,
     finishReason: details.finishReason,
     toolCallCount: details.calls?.length ?? 0,
     totalToolCalls: details.totalToolCalls,
@@ -107,33 +229,6 @@ function allConversationText(input: OrchestratorInput): string[] {
   ];
 }
 
-function isValidModelNumber(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{1,79}$/.test(value);
-}
-
-function resolveModelNumber(input: OrchestratorInput, candidate?: string | null): string | undefined {
-  const known = [input.appliance.modelNumber, input.context.confirmedModelNumber, candidate].filter(
-    (value): value is string => Boolean(value && isValidModelNumber(value)),
-  );
-  for (const value of known) {
-    if (value === input.appliance.modelNumber || value === input.context.confirmedModelNumber) return value;
-    if (allConversationText(input).some((text) => text.includes(value))) return value;
-  }
-  return undefined;
-}
-
-function inferModelScope(input: OrchestratorInput): DiagnosisContextDto['modelScope'] {
-  const text = allConversationText(input).join(' ').toLowerCase();
-  if (input.appliance.category === 'REFRIGERATOR' && /french door|bottom freezer/.test(text)) {
-    return 'FRENCH_DOOR_BOTTOM_FREEZER';
-  }
-  if (input.appliance.category === 'WASHING_MACHINE') {
-    if (/top[\s-]?load/.test(text)) return 'TOP_LOAD';
-    if (/front[\s-]?load/.test(text)) return 'FRONT_LOAD';
-  }
-  return undefined;
-}
-
 type ErrorCodeResolution =
   | { status: 'matched'; id: string }
   | { status: 'ineligible'; reason: string };
@@ -151,9 +246,9 @@ async function resolveErrorCodeId(
   const normalized = errorCode.trim().toUpperCase();
   const knowledge = await searchErrorCodes(
     {
-      category: input.appliance.category,
-      brand: input.appliance.brand,
-      modelScope: input.context.modelScope,
+      category: input.identity.category,
+      brand: input.identity.brand,
+      modelScope: input.identity.modelScope ?? undefined,
     },
     [normalized],
     input.includeUnreviewed,
@@ -175,12 +270,6 @@ async function resolveErrorCodeId(
     };
   }
   return { status: 'matched', id: matches[0]!.id };
-}
-
-function hasHazard(input: OrchestratorInput, final: SubmitDiagnosisOutcome, knowledge: KnowledgeDto): boolean {
-  const stepText = knowledge.repairSteps.map((step) => step.instruction).join(' ');
-  const facts = final.diagnosticFacts ?? [];
-  return HAZARD_PATTERN.test([input.userContent, final.reply, stepText, ...facts].join(' '));
 }
 
 function mergeUnique(current: readonly string[], additions: readonly string[], max: number): string[] {
@@ -210,10 +299,16 @@ function defaultProgress(outcome: DiagnosisOutcome, followUpQuestion?: string | 
 }
 
 function decideOutcome(input: OrchestratorInput, final: SubmitDiagnosisOutcome, state: ToolState) {
-  const hazard = hasHazard(input, final, state.repairSequence?.eligible ? withRepairSteps(state) : { ...input.knowledge, repairSteps: [] });
-  const modelNumber = resolveModelNumber(input, final.modelNumber);
+  const safety = classifySafety(
+    input,
+    final,
+    state.repairSequence?.eligible ? state.repairSequence.steps : input.knowledge.repairSteps,
+  );
+  const hazard = safety.immediateHazard || safety.unsafeInstructions;
+  const trustedModel = hasTrustedModel(input.identity) ? input.identity : null;
   let outcome = final.outcome;
   let reply = final.reply;
+  let conflictOverride = false;
 
   if (hazard) {
     outcome = 'TECHNICIAN_REQUIRED';
@@ -223,14 +318,29 @@ function decideOutcome(input: OrchestratorInput, final: SubmitDiagnosisOutcome, 
     outcome = state.repairSequence?.eligible ? 'READY_FOR_CONFIRMATION' : 'UNRESOLVED';
   } else if (outcome === 'READY_FOR_CONFIRMATION' && !state.repairSequence?.eligible) {
     outcome = 'UNRESOLVED';
-  } else if (outcome === 'NEEDS_PART' && !modelNumber) {
-    outcome = 'NEEDS_MODEL_NUMBER';
+  } else if (
+    !trustedModel &&
+    (outcome === 'NEEDS_PART' || outcome === 'NEEDS_MODEL_NUMBER')
+  ) {
+    conflictOverride = input.identity.modelConflict;
+    outcome = conflictOverride ? 'NEEDS_CLARIFICATION' : 'NEEDS_MODEL_NUMBER';
   }
 
+  const identityQuestion = input.identity.modelConflict
+    ? 'I have conflicting model numbers. Which exact model is on the appliance sticker?'
+    : 'What is the exact appliance model number from the sticker?';
+  // Terminal verdicts close the diagnostic path: carrying a diagnostic question
+  // into a stop-now or otherwise terminal result is contradictory.
+  const terminalOutcome =
+    outcome === 'TECHNICIAN_REQUIRED' || outcome === 'NEEDS_PART' || outcome === 'UNRESOLVED';
   const followUpQuestion =
-    outcome === 'NEEDS_MODEL_NUMBER'
-      ? final.followUpQuestion ?? 'What is the exact appliance model number from the sticker?'
-      : final.followUpQuestion;
+    hazard || terminalOutcome
+      ? undefined
+      : conflictOverride
+        ? identityQuestion
+        : outcome === 'NEEDS_MODEL_NUMBER'
+          ? final.followUpQuestion ?? identityQuestion
+          : final.followUpQuestion;
 
   const safeKnowledge: KnowledgeDto = {
     ...input.knowledge,
@@ -244,18 +354,17 @@ function decideOutcome(input: OrchestratorInput, final: SubmitDiagnosisOutcome, 
     ...input.context,
     suspectedComponents: mergeUnique(input.context.suspectedComponents, final.suspectedComponents ?? [], 10),
     diagnosticFacts: mergeUnique(input.context.diagnosticFacts, final.diagnosticFacts ?? [], 20),
-    ...(modelNumber ? { confirmedModelNumber: modelNumber, modelNumberSource: modelNumber === input.appliance.modelNumber ? 'APPLIANCE' : 'USER_MESSAGE' } : {}),
-    ...(inferModelScope(input) ? { modelScope: inferModelScope(input) } : {}),
+    trustedApplianceIdentity: toPersistedTrustedApplianceIdentity(input.identity),
     ...(input.context.errorCodeHypothesis || state.repairSequence?.eligible
       ? { errorCodeHypothesis: input.context.errorCodeHypothesis ?? extractCandidateCodes(allConversationText(input))[0] }
       : {}),
     currentOutcome: outcome,
-    ...(outcome === 'NEEDS_PART' && final.component
+    ...(outcome === 'NEEDS_PART' && final.component && trustedModel
       ? {
           lastPartsQuery: {
             component: final.component,
             ...(final.partNumber ? { partNumber: final.partNumber } : {}),
-            ...(modelNumber ? { modelNumberUsed: modelNumber } : {}),
+            modelNumberUsed: trustedModel.modelNumber,
           },
         }
       : {}),
@@ -284,16 +393,9 @@ function decideOutcome(input: OrchestratorInput, final: SubmitDiagnosisOutcome, 
     parts: state.parts,
     citations: uniqueCitations,
     nextContext,
-    errorCodeId: state.repairSequence?.eligible ? state.repairSequence.errorCodeId : undefined,
-    issueFixChallenge: outcome === 'READY_FOR_CONFIRMATION' && Boolean(state.repairSequence?.eligible),
-  };
-}
-
-function withRepairSteps(state: ToolState): KnowledgeDto {
-  return {
-    unverified: false,
-    errorCodes: [],
-    repairSteps: state.repairSequence?.eligible ? state.repairSequence.steps : [],
+    errorCodeId: !hazard && state.repairSequence?.eligible ? state.repairSequence.errorCodeId : undefined,
+    issueFixChallenge:
+      !hazard && outcome === 'READY_FOR_CONFIRMATION' && Boolean(state.repairSequence?.eligible),
   };
 }
 
@@ -322,7 +424,6 @@ function forcedToolFallback(
       followUpQuestion: null,
       suspectedComponents: null,
       diagnosticFacts: null,
-      modelNumber: null,
       component: null,
       partNumber: null,
     },
@@ -354,9 +455,9 @@ async function executeTool(
     const codes = parsed.codes?.length ? parsed.codes : extractCandidateCodes(allConversationText(input));
     const knowledge = await searchErrorCodes(
       {
-        category: input.appliance.category,
-        brand: input.appliance.brand,
-        modelScope: input.context.modelScope,
+        category: input.identity.category,
+        brand: input.identity.brand,
+        modelScope: input.identity.modelScope ?? undefined,
       },
       codes,
       input.includeUnreviewed,
@@ -376,9 +477,9 @@ async function executeTool(
       sequence = await getApprovedRepairSequence(
         resolved.id,
         {
-          category: input.appliance.category,
-          brand: input.appliance.brand,
-          modelScope: input.context.modelScope,
+          category: input.identity.category,
+          brand: input.identity.brand,
+          modelScope: input.identity.modelScope ?? undefined,
         } satisfies KnowledgeApplianceContext,
         input.includeUnreviewed,
       );
@@ -394,10 +495,15 @@ async function executeTool(
 
   if (name === 'find_replacement_parts') {
     const parsed = findReplacementPartsArgsSchema.parse(args);
-    const modelNumber = resolveModelNumber(input, parsed.modelNumber);
-    if (!modelNumber) {
+    const trustedIdentity = input.identity;
+    // No model argument exists in the tool schema. The provider is called only
+    // with the resolved, provenance-bearing identity from this turn's fresh
+    // appliance row (or a valid versioned USER_MESSAGE model).
+    if (!hasTrustedModel(trustedIdentity)) {
       const parts: PartsDto = {
-        note: 'Ask the user for the exact appliance model number before parts discovery.',
+        note: input.identity.modelConflict
+          ? 'Conflicting model numbers were reported. Confirm the exact model from the sticker before parts discovery.'
+          : 'Ask the user for the exact appliance model number before parts discovery.',
         candidates: [],
       };
       state.parts = parts;
@@ -408,8 +514,9 @@ async function executeTool(
     let parts: PartsDto;
     try {
       parts = await input.partsSearch({
-        brand: input.appliance.brand,
-        modelNumber,
+        brand: trustedIdentity.brand,
+        modelNumber: trustedIdentity.modelNumber,
+        modelSource: trustedIdentity.modelSource,
         component: parsed.component,
         ...(parsed.partNumber ? { partNumber: parsed.partNumber } : {}),
       });
@@ -429,32 +536,32 @@ async function executeTool(
 }
 
 export async function runDiagnosisTurn(input: OrchestratorInput): Promise<OrchestratorResult> {
-  const messages: Groq.Chat.Completions.ChatCompletionMessageParam[] = buildDiagnosisMessages(input);
+  const prompt = buildDiagnosisPrompt(input);
+  // Gemini is used statelessly: the orchestrator owns the bounded history and
+  // replays provider steps verbatim, including function_call signatures.
+  const steps: AiStep[] = [...prompt.steps];
   const state: ToolState = {};
   const seenToolCalls = new Set<string>();
   let toolCalls = 0;
 
-  for (let round = 0; round < env.GROQ_MAX_TOOL_ROUNDS; round += 1) {
+  for (let round = 0; round < env.GEMINI_MAX_TOOL_ROUNDS; round += 1) {
     // A lookup on round one must be followed by the structured outcome on
     // round two. Forcing the tool choice in the backend prevents the provider
     // from spending the whole loop on chained lookups and still caps work at
     // one lookup plus one final call per turn.
-    const toolChoice: 'required' | { type: 'function'; function: { name: string } } =
+    const toolChoice: AiToolChoice =
       round === 0
-        ? 'required'
-        : { type: 'function', function: { name: 'submit_diagnosis_outcome' } };
+        ? { mode: 'any' }
+        : { mode: 'specific', name: 'submit_diagnosis_outcome' };
 
-    let completion;
+    let response: AiProviderResponse;
     try {
-      completion = await createChatCompletion(
+      response = await createAiInteraction(
         {
-          model: env.GROQ_MODEL,
-          messages,
+          systemInstruction: prompt.systemInstruction,
+          steps,
           tools: diagnosisTools,
-          tool_choice: toolChoice,
-          temperature: 0.2,
-          max_completion_tokens: env.GROQ_MAX_COMPLETION_TOKENS,
-          reasoning_effort: env.GROQ_REASONING_EFFORT,
+          toolChoice,
         },
         // Diagnostics-only: labels provider rejections with the round and the
         // effective tool choice without altering the request or retry policy.
@@ -463,9 +570,8 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
     } catch (error) {
       if (
         error instanceof ForcedToolNotCalledError &&
-        typeof toolChoice === 'object' &&
-        toolChoice.type === 'function' &&
-        toolChoice.function.name === 'submit_diagnosis_outcome'
+        toolChoice.mode === 'specific' &&
+        toolChoice.name === 'submit_diagnosis_outcome'
       ) {
         return forcedToolFallback(input, state, round, toolCalls);
       }
@@ -473,14 +579,8 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
       throw new HttpError(502, 'AI_INVALID_RESPONSE', 'AI provider returned an invalid response');
     }
 
-    const choice = completion.choices[0];
-    const assistantMessage = choice?.message;
-    const finishReason = choice?.finish_reason;
-    const calls = assistantMessage?.tool_calls ?? [];
-
-    if (!assistantMessage) {
-      failTool('AI provider returned no message', { round, finishReason, calls, totalToolCalls: toolCalls });
-    }
+    const calls = response.calls;
+    const finishReason = response.finishReason;
 
     if (calls.length === 0) {
       failTool('AI provider did not return a structured outcome', {
@@ -501,14 +601,25 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
 
     const call = calls[0]!;
     toolCalls += 1;
-    if (toolCalls > env.GROQ_MAX_TOOL_CALLS) {
+    if (toolCalls > env.GEMINI_MAX_TOOL_CALLS) {
       failTool('AI tool-call limit exceeded', { round, finishReason, calls, totalToolCalls: toolCalls });
     }
 
     let args: unknown;
-    try {
-      args = JSON.parse(call.function.arguments);
-    } catch {
+    if (typeof call.arguments === 'string') {
+      try {
+        args = JSON.parse(call.arguments);
+      } catch {
+        failTool('AI provider returned invalid tool arguments', {
+          round,
+          finishReason,
+          calls,
+          totalToolCalls: toolCalls,
+        });
+      }
+    } else if (call.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments)) {
+      args = call.arguments;
+    } else {
       failTool('AI provider returned invalid tool arguments', {
         round,
         finishReason,
@@ -517,7 +628,7 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
       });
     }
 
-    const signature = `${call.function.name}:${JSON.stringify(args)}`;
+    const signature = `${call.name}:${JSON.stringify(args)}`;
     if (seenToolCalls.has(signature)) {
       failTool('AI provider repeated a tool call', { round, finishReason, calls, totalToolCalls: toolCalls });
     }
@@ -525,7 +636,7 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
 
     let result: unknown;
     try {
-      result = await executeTool(call.function.name, args, input, state);
+      result = await executeTool(call.name, args, input, state);
     } catch (error) {
       const issuePaths =
         error instanceof ZodError ? error.issues.map((issue) => issue.path.map(String)) : undefined;
@@ -538,11 +649,15 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
       });
     }
 
-    messages.push(assistantMessage as Groq.Chat.Completions.ChatCompletionMessageParam);
-    messages.push({
-      role: 'tool',
-      tool_call_id: call.id,
-      content: truncate(JSON.stringify(result), 4000),
+    // Replay every model-generated step exactly as received (including thought
+    // signatures), then append the backend result. Neither is trusted as
+    // identity or as repair/parts authority.
+    steps.push(...(response.steps.length ? response.steps : [call.step]));
+    steps.push({
+      type: 'function_result',
+      name: call.name,
+      call_id: call.id,
+      result: [{ type: 'text', text: truncate(JSON.stringify(result), 4000) }],
     });
 
     if (state.final) {
@@ -551,7 +666,7 @@ export async function runDiagnosisTurn(input: OrchestratorInput): Promise<Orches
   }
 
   failTool('AI tool-loop limit exceeded', {
-    round: env.GROQ_MAX_TOOL_ROUNDS - 1,
+    round: env.GEMINI_MAX_TOOL_ROUNDS - 1,
     totalToolCalls: toolCalls,
   });
 }

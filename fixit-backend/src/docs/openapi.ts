@@ -4,7 +4,7 @@ export const openApiSpec = {
     title: 'FixIt API',
     version: '1.0.0',
     description:
-      'HTTP API for the FixIt mobile app and backend diagnosis workflow. Responses use a standard envelope: success `{ "success": true, "data": ... }`, errors `{ "success": false, "error": { "code", "message" } }`. Diagnosis endpoints require a bearer access token. Send messages with a client-generated requestId to get an idempotent Groq-powered turn; approved knowledge, safety checks, parts evidence, verdicts and confirmation remain backend-controlled.',
+      'HTTP API for the FixIt mobile app and backend diagnosis workflow. Responses use a standard envelope: success `{ "success": true, "data": ... }`, errors `{ "success": false, "error": { "code", "message" } }`. Diagnosis endpoints require a bearer access token. Send messages with a client-generated requestId to get an idempotent AI-powered turn; approved knowledge, safety checks, parts evidence, verdicts and confirmation remain backend-controlled.',
   },
   servers: [
     {
@@ -16,6 +16,11 @@ export const openApiSpec = {
   tags: [
     { name: 'Health', description: 'Service health checks' },
     { name: 'Auth', description: 'Authentication and account endpoints' },
+    {
+      name: 'Appliance',
+      description:
+        'Owner-scoped saved appliances. Ownership always comes from the access token, never from the request body, params or query.',
+    },
     {
       name: 'Diagnosis',
       description:
@@ -32,6 +37,13 @@ export const openApiSpec = {
       },
     },
     parameters: {
+      ApplianceIdParam: {
+        name: 'id',
+        in: 'path',
+        required: true,
+        description: 'UUID of the appliance.',
+        schema: { type: 'string', format: 'uuid' },
+      },
       SessionIdParam: {
         name: 'id',
         in: 'path',
@@ -134,6 +146,72 @@ export const openApiSpec = {
         properties: {
           message: { type: 'string' },
         },
+      },
+      ApplianceCategory: {
+        type: 'string',
+        enum: ['WASHING_MACHINE', 'REFRIGERATOR'],
+        description: 'Values accepted by the persisted Appliance model.',
+      },
+      ApplianceDto: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Public appliance fields only; ownership data is never returned.',
+        required: ['id', 'category', 'brand', 'modelNumber', 'nickname', 'createdAt', 'updatedAt'],
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          category: { $ref: '#/components/schemas/ApplianceCategory' },
+          brand: { type: 'string', maxLength: 120 },
+          modelNumber: { type: 'string', nullable: true, maxLength: 80 },
+          nickname: { type: 'string', nullable: true, maxLength: 100 },
+          createdAt: { type: 'string', format: 'date-time' },
+          updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      PaginatedApplianceDto: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'totalPages is 0 when there are no matching appliances.',
+        required: ['items', 'page', 'limit', 'total', 'totalPages'],
+        properties: {
+          items: { type: 'array', items: { $ref: '#/components/schemas/ApplianceDto' } },
+          page: { type: 'integer', example: 1 },
+          limit: { type: 'integer', example: 20 },
+          total: { type: 'integer', example: 1 },
+          totalPages: { type: 'integer', example: 1 },
+        },
+      },
+      CreateApplianceRequest: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['category', 'brand'],
+        description:
+          'category and brand are required. modelNumber and nickname are optional; blank strings normalize to null. id, userId and timestamps are not accepted.',
+        properties: {
+          category: { $ref: '#/components/schemas/ApplianceCategory' },
+          brand: { type: 'string', minLength: 1, maxLength: 120, description: 'Trimmed by the server.' },
+          modelNumber: { type: 'string', nullable: true, maxLength: 80, description: 'Trimmed by the server.' },
+          nickname: { type: 'string', nullable: true, maxLength: 100, description: 'Trimmed by the server.' },
+        },
+        example: {
+          category: 'WASHING_MACHINE',
+          brand: 'LG',
+          modelNumber: 'WW80T3040WW',
+          nickname: 'Main washer',
+        },
+      },
+      UpdateApplianceRequest: {
+        type: 'object',
+        additionalProperties: false,
+        minProperties: 1,
+        description:
+          'Provide at least one editable field. Omitted fields are preserved; explicit null clears modelNumber or nickname. id, userId and timestamps are not accepted.',
+        properties: {
+          category: { $ref: '#/components/schemas/ApplianceCategory' },
+          brand: { type: 'string', minLength: 1, maxLength: 120, description: 'Trimmed by the server.' },
+          modelNumber: { type: 'string', nullable: true, maxLength: 80, description: 'Trimmed by the server.' },
+          nickname: { type: 'string', nullable: true, maxLength: 100, description: 'Trimmed by the server.' },
+        },
+        example: { nickname: 'Kitchen fridge' },
       },
       RegisterRequest: {
         type: 'object',
@@ -548,6 +626,82 @@ export const openApiSpec = {
               success: false,
               error: { code: 'RATE_LIMITED', message: 'Too many requests; try again later' },
             },
+          },
+        },
+      },
+      ApplianceCreated: {
+        description: 'Appliance created for the authenticated user',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['success', 'data'],
+              properties: {
+                success: { type: 'boolean', enum: [true] },
+                data: { $ref: '#/components/schemas/ApplianceDto' },
+              },
+            },
+          },
+        },
+      },
+      ApplianceListed: {
+        description: 'Page of the caller’s appliances, newest first (createdAt DESC, id DESC)',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['success', 'data'],
+              properties: {
+                success: { type: 'boolean', enum: [true] },
+                data: { $ref: '#/components/schemas/PaginatedApplianceDto' },
+              },
+            },
+          },
+        },
+      },
+      ApplianceFetched: {
+        description: 'One appliance owned by the caller',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['success', 'data'],
+              properties: {
+                success: { type: 'boolean', enum: [true] },
+                data: { $ref: '#/components/schemas/ApplianceDto' },
+              },
+            },
+          },
+        },
+      },
+      ApplianceUpdated: {
+        description: 'Updated appliance DTO after a partial patch',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['success', 'data'],
+              properties: {
+                success: { type: 'boolean', enum: [true] },
+                data: { $ref: '#/components/schemas/ApplianceDto' },
+              },
+            },
+          },
+        },
+      },
+      ApplianceDeleted: {
+        description: 'Appliance deleted',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['success', 'data'],
+              properties: {
+                success: { type: 'boolean', enum: [true] },
+                data: { $ref: '#/components/schemas/MessageData' },
+              },
+            },
+            example: { success: true, data: { message: 'Appliance deleted' } },
           },
         },
       },
@@ -1136,6 +1290,99 @@ export const openApiSpec = {
         },
       },
     },
+    '/appliances': {
+      post: {
+        tags: ['Appliance'],
+        summary: 'Create a saved appliance',
+        description:
+          'Creates an appliance owned by the authenticated user. Only the validated editable fields are written; the owner id comes from the access token. Write requests are rate limited.',
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': { schema: { $ref: '#/components/schemas/CreateApplianceRequest' } },
+          },
+        },
+        responses: {
+          '201': { $ref: '#/components/responses/ApplianceCreated' },
+          '400': { $ref: '#/components/responses/ValidationError' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '429': { $ref: '#/components/responses/RateLimited' },
+          '500': { $ref: '#/components/responses/InternalError' },
+        },
+      },
+      get: {
+        tags: ['Appliance'],
+        summary: 'List the caller’s appliances',
+        description: 'Only appliances owned by the authenticated user. Ordered by createdAt DESC, id DESC.',
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { $ref: '#/components/parameters/PageParam' },
+          { $ref: '#/components/parameters/LimitParam' },
+        ],
+        responses: {
+          '200': { $ref: '#/components/responses/ApplianceListed' },
+          '400': { $ref: '#/components/responses/ValidationError' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '500': { $ref: '#/components/responses/InternalError' },
+        },
+      },
+    },
+    '/appliances/{id}': {
+      get: {
+        tags: ['Appliance'],
+        summary: 'Get one appliance',
+        description:
+          'Returns an appliance only when it is owned by the authenticated user. Nonexistent and non-owned ids return the same 404 APPLIANCE_NOT_FOUND.',
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/ApplianceIdParam' }],
+        responses: {
+          '200': { $ref: '#/components/responses/ApplianceFetched' },
+          '400': { $ref: '#/components/responses/ValidationError' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '404': { $ref: '#/components/responses/ApplianceNotFound' },
+          '500': { $ref: '#/components/responses/InternalError' },
+        },
+      },
+      patch: {
+        tags: ['Appliance'],
+        summary: 'Update an owned appliance',
+        description:
+          'Accepts only editable fields; ownership is checked with the authenticated user id. Nonexistent and non-owned ids return the same 404 APPLIANCE_NOT_FOUND. Write requests are rate limited.',
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/ApplianceIdParam' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': { schema: { $ref: '#/components/schemas/UpdateApplianceRequest' } },
+          },
+        },
+        responses: {
+          '200': { $ref: '#/components/responses/ApplianceUpdated' },
+          '400': { $ref: '#/components/responses/ValidationError' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '404': { $ref: '#/components/responses/ApplianceNotFound' },
+          '429': { $ref: '#/components/responses/RateLimited' },
+          '500': { $ref: '#/components/responses/InternalError' },
+        },
+      },
+      delete: {
+        tags: ['Appliance'],
+        summary: 'Delete an owned appliance',
+        description:
+          'Hard-deletes only the owned appliance row; historical diagnosis sessions keep their own lifecycle. Nonexistent and non-owned ids return the same 404 APPLIANCE_NOT_FOUND. Write requests are rate limited.',
+        security: [{ bearerAuth: [] }],
+        parameters: [{ $ref: '#/components/parameters/ApplianceIdParam' }],
+        responses: {
+          '200': { $ref: '#/components/responses/ApplianceDeleted' },
+          '400': { $ref: '#/components/responses/ValidationError' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '404': { $ref: '#/components/responses/ApplianceNotFound' },
+          '429': { $ref: '#/components/responses/RateLimited' },
+          '500': { $ref: '#/components/responses/InternalError' },
+        },
+      },
+    },
     '/diagnosis': {
       post: {
         tags: ['Diagnosis'],
@@ -1215,7 +1462,7 @@ export const openApiSpec = {
         tags: ['Diagnosis'],
         summary: 'Send a message and receive an idempotent AI diagnosis turn',
         description:
-          'Requires session ownership and an OPEN session. The backend loads bounded history and approved knowledge, runs a bounded Groq tool loop, then atomically persists the USER and ASSISTANT messages plus structured metadata. Replaying a committed requestId returns the stored turn without a provider call; concurrent duplicates share one in-flight turn. This endpoint is rate limited per user. Provider failures leave no partial turn. The AI never sets verdicts, repair-step eligibility, part compatibility or confirmation state.',
+          'Requires session ownership and an OPEN session. The backend loads bounded history and approved knowledge, runs a bounded Gemini tool loop, then atomically persists the USER and ASSISTANT messages plus structured metadata. Replaying a committed requestId returns the stored turn without a provider call; concurrent duplicates share one in-flight turn. This endpoint is rate limited per user. Provider failures leave no partial turn. The AI never sets verdicts, repair-step eligibility, part compatibility or confirmation state.',
         security: [{ bearerAuth: [] }],
         parameters: [{ $ref: '#/components/parameters/SessionIdParam' }],
         requestBody: {

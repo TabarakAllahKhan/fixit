@@ -18,32 +18,21 @@ import { createTestAppliance, createTestUser, deleteTestUsers, expectNoFields, s
 
 // Database integration tests must never contact a real AI provider. The
 // orchestrator, parts provider and error mapping are exercised with deterministic
-// completions; real Groq validation is a manual Swagger activity only.
-const { createChatCompletionMock } = vi.hoisted(() => ({
-  createChatCompletionMock: vi.fn(),
+// mocked interactions; live provider validation is a separate manual activity.
+const { createInteractionMock } = vi.hoisted(() => ({
+  createInteractionMock: vi.fn(),
 }));
 
-vi.mock('../../src/services/groq.service.js', () => ({
-  createChatCompletion: createChatCompletionMock,
+vi.mock('../../src/services/ai/provider.js', () => ({
+  createAiInteraction: createInteractionMock,
 }));
 
 function toolCompletion(name: string, args: unknown, id = 'call-1') {
+  const step = { type: 'function_call', id, name, arguments: args };
   return {
-    choices: [
-      {
-        message: {
-          role: 'assistant',
-          content: null,
-          tool_calls: [
-            {
-              id,
-              type: 'function',
-              function: { name, arguments: JSON.stringify(args) },
-            },
-          ],
-        },
-      },
-    ],
+    calls: [{ id, name, arguments: args, step }],
+    steps: [step],
+    text: '',
   };
 }
 
@@ -51,13 +40,13 @@ function mockFinalOutcome(
   outcome = 'NEEDS_CLARIFICATION',
   reply = 'Thanks. Can you tell me more about what happens during the cycle?',
 ) {
-  createChatCompletionMock.mockResolvedValue(
+  createInteractionMock.mockResolvedValue(
     toolCompletion('submit_diagnosis_outcome', { reply, outcome }),
   );
 }
 
 beforeEach(() => {
-  createChatCompletionMock.mockReset();
+  createInteractionMock.mockReset();
   mockFinalOutcome();
 });
 
@@ -388,7 +377,7 @@ describe('messages — listing, AI turns and closed-session protection', () => {
       kind: 'ASSISTANT_TURN',
       requestId,
     });
-    expect(createChatCompletionMock).toHaveBeenCalledTimes(1);
+    expect(createInteractionMock).toHaveBeenCalledTimes(1);
 
     const messages = await prisma.message.findMany({ where: { sessionId }, orderBy: { createdAt: 'asc' } });
     expect(messages).toHaveLength(3);
@@ -402,7 +391,13 @@ describe('messages — listing, AI turns and closed-session protection', () => {
     const storedSession = await prisma.diagnosisSession.findUniqueOrThrow({ where: { id: sessionId } });
     expect(storedSession.context).toMatchObject({
       currentOutcome: 'NEEDS_CLARIFICATION',
-      modelScope: 'TOP_LOAD',
+      trustedApplianceIdentity: {
+        version: 1,
+        modelNumber: null,
+        modelSource: null,
+        modelScope: 'TOP_LOAD',
+        scopeSource: 'USER_MESSAGE',
+      },
     });
   });
 
@@ -425,7 +420,7 @@ describe('messages — listing, AI turns and closed-session protection', () => {
     expect(first.status).toBe(201);
     expect(second.status).toBe(201);
     expect(second.body).toEqual(first.body);
-    expect(createChatCompletionMock).toHaveBeenCalledTimes(1);
+    expect(createInteractionMock).toHaveBeenCalledTimes(1);
     expect(await prisma.message.count({ where: { sessionId } })).toBe(3);
   });
 
@@ -433,7 +428,7 @@ describe('messages — listing, AI turns and closed-session protection', () => {
     const { accessToken, appliance } = await owner();
     const created = await newSession(accessToken, appliance.id);
     const sessionId = created.id as string;
-    createChatCompletionMock.mockRejectedValueOnce(
+    createInteractionMock.mockRejectedValueOnce(
       new HttpError(503, 'AI_PROVIDER_UNAVAILABLE', 'AI provider is unavailable'),
     );
 
@@ -453,7 +448,7 @@ describe('messages — listing, AI turns and closed-session protection', () => {
     const { accessToken, appliance } = await owner();
     const created = await newSession(accessToken, appliance.id);
     const sessionId = created.id as string;
-    createChatCompletionMock.mockResolvedValueOnce({ choices: [{ message: { tool_calls: [] } }] });
+    createInteractionMock.mockResolvedValueOnce({ calls: [], text: '' });
 
     const response = await request(app)
       .post(`/diagnosis/${sessionId}/messages`)
@@ -485,7 +480,7 @@ describe('messages — listing, AI turns and closed-session protection', () => {
       error: { code: 'SESSION_CLOSED', message: 'Diagnosis session is closed' },
     });
     expect(await prisma.message.count({ where: { sessionId } })).toBe(1);
-    expect(createChatCompletionMock).not.toHaveBeenCalled();
+    expect(createInteractionMock).not.toHaveBeenCalled();
   });
 
   it('does not insert when the session is closed concurrently with the conditional write', async () => {
@@ -578,16 +573,20 @@ describe('approved knowledge, confirmation and completion', () => {
       where: { id: sessionId },
       data: {
         context: {
-          confirmedModelNumber: 'TB-100',
-          modelNumberSource: 'APPLIANCE',
-          modelScope: 'TOP_LOAD',
+          trustedApplianceIdentity: {
+            version: 1,
+            modelNumber: 'TB-100',
+            modelSource: 'APPLIANCE',
+            modelScope: 'TOP_LOAD',
+            scopeSource: 'USER_MESSAGE',
+          },
           suspectedComponents: [],
           diagnosticFacts: [],
         },
       },
     });
 
-    createChatCompletionMock
+    createInteractionMock
       .mockResolvedValueOnce(toolCompletion('get_repair_steps', { errorCode: knowledge.errorCode.code }, 'call-1'))
       .mockResolvedValueOnce(
         toolCompletion(

@@ -18,7 +18,8 @@ export function corsMiddleware(req: Request, res: Response, next: NextFunction):
   res.setHeader('Vary', 'Origin');
   if (origin && allowed) {
     res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    // Advertise every method the API accepts; the allowlist above is unchanged.
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Max-Age', '600');
   }

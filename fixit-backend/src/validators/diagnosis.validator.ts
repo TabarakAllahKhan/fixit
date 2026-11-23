@@ -23,7 +23,9 @@ export const createSessionSchema = z
 
 // Bounded offset pagination. Defaults keep the first call cheap; the upper
 // limit prevents a single request from loading an entire conversation.
-const paginationSchema = {
+// Exported so other list validators (for example appliances) use the same
+// bounds without reimplementing pagination validation.
+export const paginationSchema = {
   page: z.coerce.number().int().min(1, 'Page must be at least 1').default(1),
   limit: z.coerce.number().int().min(1, 'Limit must be at least 1').max(100, 'Limit must be at most 100').default(20),
 };
@@ -34,7 +36,7 @@ export const listMessagesQuerySchema = z.object(paginationSchema);
 
 export const sendMessageSchema = z.object({
   // Client-generated idempotency key. Replaying the same key returns the
-  // stored AI turn instead of calling Groq or inserting another message pair.
+  // stored AI turn instead of calling the AI provider or inserting another message pair.
   requestId: z.uuid('Request ID must be a valid UUID'),
   content: z.string().trim().min(1, 'Message cannot be empty').max(4000, 'Message is too long'),
 });

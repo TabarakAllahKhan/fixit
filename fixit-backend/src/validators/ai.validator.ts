@@ -1,4 +1,8 @@
 import { z } from 'zod';
+import {
+  persistedTrustedApplianceIdentitySchema,
+  type PersistedTrustedApplianceIdentity,
+} from '../services/ai/appliance-identity.js';
 
 // Every structured value produced by the AI or persisted in JSON columns is
 // validated here. Tool calls and database JSON are never trusted implicitly.
@@ -95,9 +99,9 @@ export const assistantMessageMetadataSchema = z.object({
 });
 
 export const diagnosisContextSchema = z.object({
-  confirmedModelNumber: z.string().trim().min(1).max(80).optional(),
-  modelNumberSource: z.enum(['APPLIANCE', 'USER_MESSAGE']).optional(),
-  modelScope: modelScopeSchema.optional(),
+  // Only this versioned object carries persisted identity. Legacy unversioned
+  // identity keys are intentionally absent and stripped by Zod's object parser.
+  trustedApplianceIdentity: persistedTrustedApplianceIdentitySchema.nullable().optional(),
   suspectedComponents: z.array(shortText).max(10),
   diagnosticFacts: z.array(boundedText).max(20),
   errorCodeHypothesis: z.string().trim().min(1).max(64).optional(),
@@ -130,20 +134,18 @@ export const getRepairStepsArgsSchema = z.object({
 export const findReplacementPartsArgsSchema = z.object({
   component: z.string().trim().min(1).max(120),
   partNumber: z.string().trim().min(1).max(64).optional(),
-  modelNumber: z.string().trim().min(1).max(80).optional(),
 });
 
 // The model's final structured answer. It is advisory only: backend policy
 // decides the persisted verdict, compatibility and safe instruction content.
-// Groq strict tool mode sends every property, using null for absent optional
-// values. Null is equivalent to omission here; every bound and enum still applies.
+// Optional values may be omitted or sent as null by the provider. Both forms
+// are equivalent here; every bound and enum still applies.
 export const submitDiagnosisOutcomeSchema = z.object({
   reply: boundedText,
   outcome: diagnosisOutcomeSchema,
   followUpQuestion: z.string().trim().min(1).max(1000).nullable().optional(),
   suspectedComponents: z.array(shortText).max(5).nullable().optional(),
   diagnosticFacts: z.array(boundedText).max(8).nullable().optional(),
-  modelNumber: z.string().trim().min(1).max(80).nullable().optional(),
   component: shortText.nullable().optional(),
   partNumber: z.string().trim().min(1).max(64).nullable().optional(),
 });
@@ -157,6 +159,7 @@ export type PartsDto = z.infer<typeof partsDtoSchema>;
 export type DiagnosisProgressDto = z.infer<typeof diagnosisProgressSchema>;
 export type AssistantMessageMetadataDto = z.infer<typeof assistantMessageMetadataSchema>;
 export type DiagnosisContextDto = z.infer<typeof diagnosisContextSchema>;
+export type PersistedIdentityDto = PersistedTrustedApplianceIdentity;
 export type SubmitDiagnosisOutcome = z.infer<typeof submitDiagnosisOutcomeSchema>;
 export type DiagnosisOutcome = z.infer<typeof diagnosisOutcomeSchema>;
 

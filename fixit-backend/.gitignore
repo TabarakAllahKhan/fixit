@@ -3,3 +3,4 @@
 src/generated/
 .env.test
 !.env.test.example
+sequence-diagrams/

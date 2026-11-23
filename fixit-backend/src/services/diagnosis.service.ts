@@ -26,6 +26,7 @@ import type {
   SendMessageInput,
   SessionIdParam,
 } from '../validators/diagnosis.validator.js';
+import { resolveTrustedApplianceIdentity } from './ai/appliance-identity.js';
 import { runDiagnosisTurn } from './ai/orchestrator.js';
 import { extractCandidateCodes, searchErrorCodes } from './knowledge.service.js';
 import { searchReplacementParts } from './parts.service.js';
@@ -67,6 +68,7 @@ export async function listMessages(
   return toPaginatedDto(messages.map(toMessageDto), total, page, limit);
 }
 
+// This function is used to convert a pair of user and assistant messages into a TurnDto, which represents a single turn in the diagnosis session. It extracts metadata from the assistant message and ensures that both messages are present. If the metadata is missing or incomplete, it throws an HttpError indicating that the turn is incomplete.
 function toTurnDto(userMessage: MessageDto, assistantMessage: MessageDto): TurnDto {
   const metadata = parseAssistantMetadata(assistantMessage.metadata);
   if (!metadata) {
@@ -83,6 +85,8 @@ function toTurnDto(userMessage: MessageDto, assistantMessage: MessageDto): TurnD
   };
 }
 
+// This function is used to find a stored turn in the database based on the sessionID
+// and requestID. It retrieves both the user and assistant messages associated with the turn. If either message is missing, it throws an HttpError indicating that the turn is incomplete. If both messages are found, it returns a TurnDto representing the complete turn.
 async function findStoredTurn(sessionId: string, requestId: string): Promise<TurnDto | null> {
   const [userMessage, assistantMessage] = await Promise.all([
     prisma.message.findFirst({
@@ -129,6 +133,42 @@ export async function sendMessage(
   }
 }
 
+/*
+Verifies the user owns the diagnosis session.
+
+
+
+Checks whether the session is still open.
+
+
+
+Checks whether this request was already processed.
+
+
+
+Retrieves conversation history.
+
+
+
+Establishes trusted appliance identity.
+
+
+
+Searches the knowledge base for relevant error codes.
+
+
+
+Runs the AI diagnosis and tool-calling loop.
+
+
+
+Saves the user message, AI response, and updated diagnosis context.
+
+
+
+Protects against concurrent requests and database conflicts.
+
+*/
 async function performSendMessage(
   userId: string,
   params: SessionIdParam,
@@ -166,22 +206,34 @@ async function performSendMessage(
     where: { sessionId: session.id },
     select: messageDtoSelect,
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-    take: env.GROQ_HISTORY_LIMIT,
+    take: env.GEMINI_HISTORY_LIMIT,
   });
   const history = historyRows.reverse().map(toMessageDto);
 
+  // Resolve identity before any provider or knowledge work. Only the fresh DB
+  // appliance and USER-authored messages are inputs; assistant history and AI
+  // diagnostic facts stay in the advisory context passed to the orchestrator.
+  const identity = resolveTrustedApplianceIdentity({
+    appliance: session.appliance,
+    persisted: context.trustedApplianceIdentity,
+    userMessages: history
+      .filter((message) => message.role === MessageRole.USER)
+      .map((message) => message.content),
+    currentUserContent: input.content,
+  });
+
   const knowledge = await searchErrorCodes(
     {
-      category: session.appliance.category,
-      brand: session.appliance.brand,
-      modelScope: context.modelScope,
+      category: identity.category,
+      brand: identity.brand,
+      modelScope: identity.modelScope ?? undefined,
     },
     extractCandidateCodes([input.content, ...context.diagnosticFacts, ...history.map((m) => m.content)]),
     env.ALLOW_UNREVIEWED_KNOWLEDGE,
   );
 
   const result = await runDiagnosisTurn({
-    appliance: session.appliance,
+    identity,
     context,
     history,
     userContent: input.content,

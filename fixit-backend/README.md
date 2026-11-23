@@ -10,8 +10,9 @@ Copy `.env.example` and set at least:
 - `DATABASE_URL` — pooled PostgreSQL connection used at runtime
 - `DIRECT_URL` — direct PostgreSQL connection used by Prisma migrations/seeds
 - `JWT_ACCESS_SECRET` — random value of at least 32 characters
+- `GOOGLE_API_KEY` — backend-only Gemini credential; optional at startup in development/test but required for any live diagnosis turn
 
-Production additionally requires `GROQ_API_KEY`, keeps `RATE_LIMIT_ENABLED=true`, and rejects `ALLOW_UNREVIEWED_KNOWLEDGE=true`.
+Production additionally requires `GOOGLE_API_KEY` (Gemini diagnosis provider), keeps `RATE_LIMIT_ENABLED=true`, and rejects `ALLOW_UNREVIEWED_KNOWLEDGE=true`.
 
 Never commit real secrets or connection strings. Never point this project at a production database during local testing.
 

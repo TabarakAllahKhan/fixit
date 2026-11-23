@@ -38,6 +38,14 @@ describe('environment schema', () => {
     expect(result.data.GROQ_HISTORY_LIMIT).toBe(12);
     expect(result.data.GROQ_MAX_COMPLETION_TOKENS).toBe(1200);
     expect(result.data.GROQ_REASONING_EFFORT).toBe('low');
+    expect(result.data.GEMINI_MODEL).toBe('gemini-3.5-flash-lite');
+    expect(result.data.GEMINI_TIMEOUT_MS).toBe(30_000);
+    expect(result.data.GEMINI_MAX_OUTPUT_TOKENS).toBe(3_000);
+    expect(result.data.GEMINI_THINKING_LEVEL).toBe('minimal');
+    expect(result.data.GEMINI_MAX_TOOL_ROUNDS).toBe(2);
+    expect(result.data.GEMINI_MAX_TOOL_CALLS).toBe(3);
+    expect(result.data.GEMINI_HISTORY_LIMIT).toBe(12);
+    expect(result.data.GOOGLE_API_KEY).toBeUndefined();
     expect(result.data.FIX_CONFIRMATION_TTL_SECONDS).toBe(600);
     expect(result.data.PARTS_PROVIDER).toBe('none');
     expect(result.data.PARTS_MAX_RESULTS).toBe(5);
@@ -64,6 +72,48 @@ describe('environment schema', () => {
     if (result.success) expect(result.data.GROQ_MODEL).toBe('openai/gpt-oss-120b');
 
     expect(failingPaths({ ...baseEnv, GROQ_MODEL: '   ' })).toContain('GROQ_MODEL');
+  });
+
+  it('locks the Gemini model to the approved free-tier model and bounds its limits', () => {
+    const valid = parseEnv({
+      ...baseEnv,
+      GEMINI_TIMEOUT_MS: '45000',
+      GEMINI_MAX_OUTPUT_TOKENS: '2000',
+      GEMINI_THINKING_LEVEL: 'low',
+      GEMINI_MAX_TOOL_ROUNDS: '3',
+      GEMINI_MAX_TOOL_CALLS: '4',
+      GEMINI_HISTORY_LIMIT: '8',
+    });
+    expect(valid.success).toBe(true);
+    if (valid.success) {
+      expect(valid.data.GEMINI_MODEL).toBe('gemini-3.5-flash-lite');
+      expect(valid.data.GEMINI_TIMEOUT_MS).toBe(45_000);
+      expect(valid.data.GEMINI_MAX_OUTPUT_TOKENS).toBe(2_000);
+      expect(valid.data.GEMINI_THINKING_LEVEL).toBe('low');
+      expect(valid.data.GEMINI_MAX_TOOL_ROUNDS).toBe(3);
+      expect(valid.data.GEMINI_MAX_TOOL_CALLS).toBe(4);
+      expect(valid.data.GEMINI_HISTORY_LIMIT).toBe(8);
+    }
+
+    expect(failingPaths({ ...baseEnv, GEMINI_MODEL: 'gemini-3.1-pro-preview' })).toContain(
+      'GEMINI_MODEL',
+    );
+    expect(failingPaths({ ...baseEnv, GEMINI_TIMEOUT_MS: '0' })).toContain('GEMINI_TIMEOUT_MS');
+    expect(failingPaths({ ...baseEnv, GEMINI_MAX_OUTPUT_TOKENS: '100000' })).toContain(
+      'GEMINI_MAX_OUTPUT_TOKENS',
+    );
+    expect(failingPaths({ ...baseEnv, GEMINI_THINKING_LEVEL: 'extreme' })).toContain(
+      'GEMINI_THINKING_LEVEL',
+    );
+    expect(failingPaths({ ...baseEnv, GEMINI_MAX_TOOL_ROUNDS: '0' })).toContain(
+      'GEMINI_MAX_TOOL_ROUNDS',
+    );
+    expect(failingPaths({ ...baseEnv, GEMINI_MAX_TOOL_CALLS: '20' })).toContain(
+      'GEMINI_MAX_TOOL_CALLS',
+    );
+    expect(failingPaths({ ...baseEnv, GEMINI_HISTORY_LIMIT: '100' })).toContain(
+      'GEMINI_HISTORY_LIMIT',
+    );
   });
 
   it('validates bounded Groq limits and parts configuration', () => {
@@ -96,32 +146,62 @@ describe('environment schema', () => {
     );
   });
 
-  it('requires GROQ_API_KEY in production', () => {
-    expect(failingPaths({ ...baseEnv, NODE_ENV: 'production' })).toContain('GROQ_API_KEY');
+  it('requires GOOGLE_API_KEY in production', () => {
+    expect(failingPaths({ ...baseEnv, NODE_ENV: 'production' })).toContain('GOOGLE_API_KEY');
   });
 
-  it('accepts production with a GROQ_API_KEY', () => {
+  it('accepts production with a GOOGLE_API_KEY and no Groq credential', () => {
     const result = parseEnv({
       ...baseEnv,
       NODE_ENV: 'production',
-      GROQ_API_KEY: 'production-key',
+      GOOGLE_API_KEY: 'production-key',
     });
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data.GROQ_API_KEY).toBe('production-key');
+      expect(result.data.GOOGLE_API_KEY).toBe('production-key');
+      expect(result.data.GROQ_API_KEY).toBeUndefined();
+      expect(result.data.GEMINI_MODEL).toBe('gemini-3.5-flash-lite');
       expect(result.data.ALLOW_UNREVIEWED_KNOWLEDGE).toBe(false);
     }
   });
 
-  it('treats an empty GROQ_API_KEY as absent', () => {
-    const development = parseEnv({ ...baseEnv, GROQ_API_KEY: '   ' });
+  it('treats an empty GOOGLE_API_KEY as absent', () => {
+    const development = parseEnv({ ...baseEnv, GOOGLE_API_KEY: '   ' });
     expect(development.success).toBe(true);
-    if (development.success) expect(development.data.GROQ_API_KEY).toBeUndefined();
+    if (development.success) expect(development.data.GOOGLE_API_KEY).toBeUndefined();
 
     expect(
-      failingPaths({ ...baseEnv, NODE_ENV: 'production', GROQ_API_KEY: '   ' }),
+      failingPaths({ ...baseEnv, NODE_ENV: 'production', GOOGLE_API_KEY: '   ' }),
+    ).toContain('GOOGLE_API_KEY');
+  });
+
+  it('requires a Groq credential in production only for the legacy parts provider', () => {
+    expect(
+      parseEnv({
+        ...baseEnv,
+        NODE_ENV: 'production',
+        GOOGLE_API_KEY: 'production-key',
+        PARTS_PROVIDER: 'groq_browser',
+      }).success,
+    ).toBe(false);
+    expect(
+      failingPaths({
+        ...baseEnv,
+        NODE_ENV: 'production',
+        GOOGLE_API_KEY: 'production-key',
+        PARTS_PROVIDER: 'groq_browser',
+      }),
     ).toContain('GROQ_API_KEY');
+    expect(
+      parseEnv({
+        ...baseEnv,
+        NODE_ENV: 'production',
+        GOOGLE_API_KEY: 'production-key',
+        GROQ_API_KEY: 'legacy-parts-key',
+        PARTS_PROVIDER: 'groq_browser',
+      }).success,
+    ).toBe(true);
   });
 
   it('rejects disabled rate limiting in production', () => {
@@ -129,7 +209,7 @@ describe('environment schema', () => {
       failingPaths({
         ...baseEnv,
         NODE_ENV: 'production',
-        GROQ_API_KEY: 'production-key',
+        GOOGLE_API_KEY: 'production-key',
         RATE_LIMIT_ENABLED: 'false',
       }),
     ).toContain('RATE_LIMIT_ENABLED');
@@ -140,7 +220,7 @@ describe('environment schema', () => {
       failingPaths({
         ...baseEnv,
         NODE_ENV: 'production',
-        GROQ_API_KEY: 'production-key',
+        GOOGLE_API_KEY: 'production-key',
         ALLOW_UNREVIEWED_KNOWLEDGE: 'true',
       }),
     ).toContain('ALLOW_UNREVIEWED_KNOWLEDGE');

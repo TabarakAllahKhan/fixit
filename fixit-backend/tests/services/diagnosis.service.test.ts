@@ -146,16 +146,21 @@ describe('sendMessage reliability', () => {
   });
 
   it('does not persist a partial turn when the provider fails', async () => {
-    runDiagnosisTurnMock.mockRejectedValueOnce(
+    const failures = [
       new HttpError(503, 'AI_PROVIDER_UNAVAILABLE', 'AI provider is unavailable'),
-    );
+      new HttpError(502, 'AI_PROVIDER_REJECTED', 'AI provider rejected the request'),
+    ];
 
-    await expect(
-      sendMessage('user-1', { id: sessionId }, { requestId, content: 'Provider fails' }),
-    ).rejects.toMatchObject({ code: 'AI_PROVIDER_UNAVAILABLE' });
+    for (const failure of failures) {
+      runDiagnosisTurnMock.mockRejectedValueOnce(failure);
 
-    expect(prisma.message.create).not.toHaveBeenCalled();
-    expect(prisma.diagnosisSession.update).not.toHaveBeenCalled();
+      await expect(
+        sendMessage('user-1', { id: sessionId }, { requestId, content: 'Provider fails' }),
+      ).rejects.toMatchObject({ code: failure.code });
+
+      expect(prisma.message.create).not.toHaveBeenCalled();
+      expect(prisma.diagnosisSession.update).not.toHaveBeenCalled();
+    }
   });
 
   it('shares one in-flight provider turn for concurrent duplicate requests', async () => {
@@ -211,7 +216,7 @@ describe('sendMessage reliability', () => {
     expect(result.assistantMessage.id).toBe(assistantRow().id);
   });
 
-  it('keeps Groq outside the persistence transaction', async () => {
+  it('keeps the AI provider outside the persistence transaction', async () => {
     let providerCalledInsideTransaction = false;
     prisma.$transaction.mockImplementation(async (callback: (client: typeof prisma) => unknown) => {
       providerCalledInsideTransaction = true;
@@ -230,6 +235,158 @@ describe('sendMessage reliability', () => {
 
     expect(runDiagnosisTurnMock).toHaveBeenCalledTimes(1);
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('sendMessage trusted identity resolution', () => {
+  function historyRow(role: MessageRole, content: string, suffix: string) {
+    return {
+      id: `00000000-0000-4000-8000-${suffix}`,
+      sessionId,
+      role,
+      content,
+      createdAt: new Date(),
+      metadata: null,
+    };
+  }
+
+  function lastOrchestratorInput() {
+    expect(runDiagnosisTurnMock).toHaveBeenCalledTimes(1);
+    return runDiagnosisTurnMock.mock.calls[0]![0] as {
+      identity: {
+        category: string;
+        brand: string;
+        modelNumber: string | null;
+        modelSource: string | null;
+        modelScope: string | null;
+        modelConflict: boolean;
+      };
+      context: Record<string, unknown>;
+      history: unknown[];
+      userContent: string;
+    };
+  }
+
+  it('uses the fresh registered appliance model over user, assistant and legacy claims', async () => {
+    prisma.diagnosisSession.findFirst.mockResolvedValue(
+      openSession({
+        appliance: { category: 'WASHING_MACHINE', brand: 'FreshBrand', modelNumber: 'DB-MODEL' },
+        context: {
+          confirmedModelNumber: 'LEGACY-MODEL',
+          modelNumberSource: 'USER_MESSAGE',
+          modelScope: 'TOP_LOAD',
+          suspectedComponents: [],
+          diagnosticFacts: [],
+        },
+      }),
+    );
+    prisma.message.findMany.mockResolvedValue([
+      historyRow(MessageRole.USER, 'My model is USER-MODEL', '0000000000b1'),
+      historyRow(MessageRole.ASSISTANT, 'You said it was ASSISTANT-MODEL', '0000000000b2'),
+    ]);
+
+    await sendMessage('user-1', { id: sessionId }, {
+      requestId,
+      content: 'It shows FE',
+    });
+
+    const call = lastOrchestratorInput();
+    expect(call.identity).toMatchObject({
+      category: 'WASHING_MACHINE',
+      brand: 'FreshBrand',
+      modelNumber: 'DB-MODEL',
+      modelSource: 'APPLIANCE',
+      modelScope: null,
+      modelConflict: false,
+    });
+    expect(call.context).not.toHaveProperty('confirmedModelNumber');
+    expect(call.context).not.toHaveProperty('modelScope');
+    expect(call.history).toHaveLength(2);
+    expect(searchErrorCodesMock).toHaveBeenCalledWith(
+      { category: 'WASHING_MACHINE', brand: 'FreshBrand', modelScope: undefined },
+      expect.anything(),
+      false,
+    );
+  });
+
+  it('persists versioned USER_MESSAGE identity across turns and ignores assistant text', async () => {
+    prisma.diagnosisSession.findFirst.mockResolvedValue(
+      openSession({
+        context: {
+          trustedApplianceIdentity: {
+            version: 1,
+            modelNumber: 'USER-MODEL',
+            modelSource: 'USER_MESSAGE',
+            modelScope: 'TOP_LOAD',
+            scopeSource: 'USER_MESSAGE',
+          },
+          suspectedComponents: [],
+          diagnosticFacts: [],
+        },
+      }),
+    );
+    prisma.message.findMany.mockResolvedValue([
+      historyRow(MessageRole.ASSISTANT, 'The model is AI-FACT-MODEL', '0000000000b3'),
+    ]);
+
+    await sendMessage('user-1', { id: sessionId }, {
+      requestId,
+      content: 'What should I check next?',
+    });
+
+    expect(lastOrchestratorInput().identity).toMatchObject({
+      modelNumber: 'USER-MODEL',
+      modelSource: 'USER_MESSAGE',
+      modelScope: 'TOP_LOAD',
+      scopeSource: 'USER_MESSAGE',
+    });
+  });
+
+  it('does not promote a stale APPLIANCE-source model when the registered model is cleared', async () => {
+    prisma.diagnosisSession.findFirst.mockResolvedValue(
+      openSession({
+        appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: null },
+        context: {
+          trustedApplianceIdentity: {
+            version: 1,
+            modelNumber: 'OLD-REGISTERED',
+            modelSource: 'APPLIANCE',
+            modelScope: 'TOP_LOAD',
+            scopeSource: 'USER_MESSAGE',
+          },
+          suspectedComponents: [],
+          diagnosticFacts: [],
+        },
+      }),
+    );
+
+    await sendMessage('user-1', { id: sessionId }, {
+      requestId,
+      content: 'Still not draining',
+    });
+
+    expect(lastOrchestratorInput().identity).toMatchObject({
+      modelNumber: null,
+      modelSource: null,
+      modelConflict: false,
+    });
+  });
+
+  it('passes conflicting user claims through as unknown identity for clarification', async () => {
+    prisma.message.findMany.mockResolvedValue([
+      historyRow(MessageRole.USER, 'Model WW80T3040AA', '0000000000b4'),
+    ]);
+
+    await sendMessage('user-1', { id: sessionId }, {
+      requestId,
+      content: 'No, the model is WW80T3040BB',
+    });
+
+    expect(lastOrchestratorInput().identity).toMatchObject({
+      modelNumber: null,
+      modelSource: null,
+      modelConflict: true,
+    });
   });
 });
 

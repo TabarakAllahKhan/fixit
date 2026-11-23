@@ -60,6 +60,20 @@ export const envSchema = z
     GROQ_HISTORY_LIMIT: z.coerce.number().int().min(1).max(50).default(12),
     GROQ_MAX_COMPLETION_TOKENS: z.coerce.number().int().min(256).max(8_192).default(1_200),
     GROQ_REASONING_EFFORT: z.enum(['none', 'default', 'low', 'medium', 'high']).default('low'),
+
+    // Google Gemini is the production AI provider for the diagnosis flow. The
+    // credential is backend-only and must never reach the mobile client or logs.
+    GOOGLE_API_KEY: optionalTrimmedString,
+    // Locked to the single approved free-tier model: deployments cannot silently
+    // switch to a different (potentially paid) model through configuration.
+    GEMINI_MODEL: z.literal('gemini-3.5-flash-lite').default('gemini-3.5-flash-lite'),
+    GEMINI_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
+    GEMINI_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(256).max(8_192).default(3_000),
+    GEMINI_THINKING_LEVEL: z.enum(['minimal', 'low', 'medium', 'high']).default('minimal'),
+    GEMINI_MAX_TOOL_ROUNDS: z.coerce.number().int().min(1).max(5).default(2),
+    GEMINI_MAX_TOOL_CALLS: z.coerce.number().int().min(1).max(10).default(3),
+    GEMINI_HISTORY_LIMIT: z.coerce.number().int().min(1).max(50).default(12),
+
     FIX_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(600),
     // Disabled by default. Enable only for controlled browser-search testing.
     PARTS_PROVIDER: z.enum(['none', 'groq_browser']).default('none'),
@@ -77,11 +91,22 @@ export const envSchema = z
   .superRefine((value, ctx) => {
     if (value.NODE_ENV !== 'production') return;
 
-    if (!value.GROQ_API_KEY) {
+    if (!value.GOOGLE_API_KEY) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['GOOGLE_API_KEY'],
+        message: 'GOOGLE_API_KEY is required in production',
+      });
+    }
+
+    // The legacy browser parts provider is opt-in, but if enabled it still
+    // needs its own credential. Fail at startup instead of silently returning
+    // no parts in production.
+    if (value.PARTS_PROVIDER === 'groq_browser' && !value.GROQ_API_KEY) {
       ctx.addIssue({
         code: 'custom',
         path: ['GROQ_API_KEY'],
-        message: 'GROQ_API_KEY is required in production',
+        message: 'GROQ_API_KEY is required in production when PARTS_PROVIDER=groq_browser',
       });
     }
 

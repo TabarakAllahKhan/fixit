@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ReviewStatus, SourceKind } from '../../src/generated/prisma/client.js';
+import { resolveTrustedApplianceIdentity } from '../../src/services/ai/appliance-identity.js';
 import { emptyDiagnosisContext, type DiagnosisContextDto } from '../../src/validators/ai.validator.js';
 
-const { findManyMock, createChatCompletionMock, getApprovedRepairSequenceMock } = vi.hoisted(() => ({
+const { findManyMock, createInteractionMock, getApprovedRepairSequenceMock } = vi.hoisted(() => ({
   findManyMock: vi.fn(),
-  createChatCompletionMock: vi.fn(),
+  createInteractionMock: vi.fn(),
   getApprovedRepairSequenceMock: vi.fn(),
 }));
 
@@ -12,8 +13,8 @@ vi.mock('../../src/config/prisma.js', () => ({
   prisma: { errorCode: { findMany: findManyMock } },
 }));
 
-vi.mock('../../src/services/groq.service.js', () => ({
-  createChatCompletion: createChatCompletionMock,
+vi.mock('../../src/services/ai/provider.js', () => ({
+  createAiInteraction: createInteractionMock,
 }));
 
 // Keep the real searchErrorCodes() so resolution is exercised against actual
@@ -70,25 +71,24 @@ const approvedSequence = {
 };
 
 function completion(name: string, args: unknown, id: string) {
+  const step = { type: 'function_call', id, name, arguments: args };
   return {
-    choices: [
-      {
-        finish_reason: 'tool_calls',
-        message: {
-          role: 'assistant',
-          content: null,
-          tool_calls: [
-            { id, type: 'function', function: { name, arguments: JSON.stringify(args) } },
-          ],
-        },
-      },
-    ],
+    calls: [{ id, name, arguments: args, step }],
+    steps: [step],
+    text: '',
+    finishReason: 'completed',
   };
 }
 
-function input(context: DiagnosisContextDto = { ...emptyDiagnosisContext(), modelScope: 'TOP_LOAD' }): OrchestratorInput {
-  return {
+function input(context: DiagnosisContextDto = emptyDiagnosisContext()): OrchestratorInput {
+  const trustedIdentity = resolveTrustedApplianceIdentity({
     appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: null },
+    userMessages: [],
+    currentUserContent: 'top-load washer',
+  });
+  expect(trustedIdentity.modelScope).toBe('TOP_LOAD');
+  return {
+    identity: trustedIdentity,
     context,
     history: [],
     userContent: 'The washer shows an error',
@@ -99,7 +99,7 @@ function input(context: DiagnosisContextDto = { ...emptyDiagnosisContext(), mode
 }
 
 async function callRepairSteps(errorCode: string, context?: DiagnosisContextDto) {
-  createChatCompletionMock
+  createInteractionMock
     .mockResolvedValueOnce(completion('get_repair_steps', { errorCode }, 'call-repair'))
     .mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', { reply: 'Follow the steps.', outcome: 'READY_FOR_CONFIRMATION' }, 'call-final'),
@@ -109,7 +109,7 @@ async function callRepairSteps(errorCode: string, context?: DiagnosisContextDto)
 
 beforeEach(() => {
   rows = [];
-  createChatCompletionMock.mockReset();
+  createInteractionMock.mockReset();
   getApprovedRepairSequenceMock
     .mockReset()
     .mockResolvedValue({ eligible: false, reason: 'No approved repair sequence is available.', steps: [] });

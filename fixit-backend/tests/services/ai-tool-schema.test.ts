@@ -2,10 +2,28 @@ import { describe, expect, it } from 'vitest';
 import { diagnosisTools } from '../../src/services/ai/tool-definitions.js';
 import {
   diagnosisOutcomeSchema,
+  findReplacementPartsArgsSchema,
   getRepairStepsArgsSchema,
   knowledgeDtoSchema,
   submitDiagnosisOutcomeSchema,
 } from '../../src/validators/ai.validator.js';
+
+// The provider declarations are flat Gemini function tools. This adapter keeps
+// the schema assertions below focused on the JSON Schema contract.
+const geminiToolsAsLegacy: Array<{
+  function?: {
+    name?: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+    strict?: boolean;
+  };
+}> = diagnosisTools.map((tool) => ({
+  function: {
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  },
+}));
 
 type OutcomeParameters = {
   type: string;
@@ -20,12 +38,11 @@ const OUTCOME_PROPERTIES = [
   'followUpQuestion',
   'suspectedComponents',
   'diagnosticFacts',
-  'modelNumber',
   'component',
   'partNumber',
 ];
 
-const outcomeTool = diagnosisTools.find(
+const outcomeTool = geminiToolsAsLegacy.find(
   (tool) => tool.function?.name === 'submit_diagnosis_outcome',
 );
 
@@ -37,10 +54,15 @@ function outcomeParameters(): OutcomeParameters {
 const validSource = { title: 'Manual', sourceKind: 'MANUAL' as const };
 
 describe('submit_diagnosis_outcome provider schema', () => {
-  it('enables strict mode only for the final outcome tool', () => {
-    expect(outcomeTool?.function?.strict).toBe(true);
+  it('uses flat Gemini function declarations without non-native strict mode', () => {
+    // Gemini's native declarations have no `strict` flag. Optional fields are
+    // described as omittable; the backend Zod schema stays authoritative.
+    expect(diagnosisTools[0]).toMatchObject({ type: 'function', name: expect.any(String) });
+    expect(diagnosisTools[0]).not.toHaveProperty('function');
+    expect(outcomeTool?.function?.strict).not.toBe(true);
+    expect(outcomeTool?.function).not.toHaveProperty('strict');
 
-    const otherTools = diagnosisTools.filter(
+    const otherTools = geminiToolsAsLegacy.filter(
       (tool) => tool.function?.name !== 'submit_diagnosis_outcome',
     );
     expect(otherTools).toHaveLength(3);
@@ -49,25 +71,38 @@ describe('submit_diagnosis_outcome provider schema', () => {
     }
   });
 
-  it('lists every property as required, matching Groq strict mode', () => {
+  it('requires only reply and outcome in the provider schema', () => {
     const parameters = outcomeParameters();
     expect(parameters.type).toBe('object');
     expect(parameters.additionalProperties).toBe(false);
     expect(Object.keys(parameters.properties).sort()).toEqual([...OUTCOME_PROPERTIES].sort());
-    expect([...parameters.required].sort()).toEqual([...OUTCOME_PROPERTIES].sort());
+    expect([...parameters.required].sort()).toEqual(['outcome', 'reply']);
   });
 
-  it('uses nullable unions for optional fields and removes strict-unsupported constraints', () => {
+  it('documents optional arguments so the model may omit or null them', () => {
+    const description = String(outcomeTool?.function?.description);
+    expect(description).toMatch(/reply and outcome are mandatory/i);
+    expect(description).toMatch(/omit optional fields/i);
+
+    const { properties } = outcomeParameters();
+    for (const name of ['followUpQuestion', 'suspectedComponents', 'diagnosticFacts', 'component', 'partNumber']) {
+      expect(String(properties[name]?.description)).toMatch(/null\/omitted/i);
+    }
+  });
+
+  it('uses Gemini-compatible scalar types for optional fields', () => {
     const { properties } = outcomeParameters();
 
-    for (const name of ['followUpQuestion', 'modelNumber', 'component', 'partNumber']) {
-      expect(properties[name]?.type).toEqual(['string', 'null']);
+    for (const name of ['followUpQuestion', 'component', 'partNumber']) {
+      expect(properties[name]?.type).toBe('string');
+      expect(properties[name]?.type).not.toContain('null');
       expect(properties[name]).not.toHaveProperty('minLength');
       expect(properties[name]).not.toHaveProperty('maxLength');
     }
 
     for (const name of ['suspectedComponents', 'diagnosticFacts']) {
-      expect(properties[name]?.type).toEqual(['array', 'null']);
+      expect(properties[name]?.type).toBe('array');
+      expect(properties[name]?.type).not.toContain('null');
       expect(properties[name]).not.toHaveProperty('maxItems');
       expect(properties[name]?.items).toEqual({ type: 'string' });
     }
@@ -201,8 +236,42 @@ describe('knowledge repair-step validation is unchanged', () => {
   });
 });
 
+describe('AI-controlled model arguments are removed', () => {
+  it('strips a modelNumber from the final outcome payload', () => {
+    const parsed = submitDiagnosisOutcomeSchema.parse({
+      reply: 'Let us narrow this down.',
+      outcome: 'NEEDS_CLARIFICATION',
+      modelNumber: 'AI-INVENTED-MODEL',
+    });
+
+    expect(parsed).not.toHaveProperty('modelNumber');
+  });
+
+  it('exposes only component and optional part number for parts discovery', () => {
+    const partsTool = geminiToolsAsLegacy.find((tool) => tool.function?.name === 'find_replacement_parts');
+    expect(partsTool).toBeDefined();
+    const parameters = partsTool!.function!.parameters as {
+      properties: Record<string, unknown>;
+      required: string[];
+      additionalProperties: boolean;
+    };
+
+    expect(Object.keys(parameters.properties).sort()).toEqual(['component', 'partNumber']);
+    expect(parameters.required).toEqual(['component']);
+    expect(parameters.additionalProperties).toBe(false);
+    expect(String(partsTool!.function!.description)).toMatch(/backend-trusted appliance identity/i);
+
+    const parsed = findReplacementPartsArgsSchema.parse({
+      component: 'drain pump',
+      modelNumber: 'AI-INVENTED-MODEL',
+    });
+    expect(parsed).toEqual({ component: 'drain pump' });
+    expect(parsed).not.toHaveProperty('modelNumber');
+  });
+});
+
 describe('get_repair_steps manufacturer-code contract', () => {
-  const repairTool = diagnosisTools.find((tool) => tool.function?.name === 'get_repair_steps');
+  const repairTool = geminiToolsAsLegacy.find((tool) => tool.function?.name === 'get_repair_steps');
 
   it('requires one bounded errorCode with no UUID format and no strict mode', () => {
     expect(repairTool?.function?.strict).not.toBe(true);
