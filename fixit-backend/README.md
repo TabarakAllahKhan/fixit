@@ -40,6 +40,20 @@ Use `/health/live` for container restarts and `/health/ready` for traffic routin
 
 Swagger UI at `/docs` and the raw spec at `/docs/openapi.json` are disabled unless `ENABLE_API_DOCS=true`. Enable them locally or in staging when needed; leave them disabled for a public production deployment unless intentionally required.
 
+## Error-code OCR
+
+`POST /ocr/error-code` is an authenticated, local Tesseract.js endpoint that returns **advisory** appliance error-code candidates only. It handles numeric (83, 01), alphabetic (FE, OE, dE, LE) and alphanumeric (E03, F5, H1, E83) codes, conservative casing/OCR-confusion normalization, and separated tokens such as `E 03` when bounding-box evidence confirms the layout. Numeric-first text such as `83 E` is never reordered. Model/serial identifiers, temperatures, clocks, dates and measurements are suppressed. It never extracts brand, model or serial number, creates a diagnosis session, or calls an AI provider. The client must always let the user confirm or correct the code before starting diagnosis.
+
+- Request: `multipart/form-data` with one file in the field named `image`.
+- Accepted formats: JPEG (`image/jpeg`), PNG (`image/png`) and WebP (`image/webp`). The file signature is checked in addition to the declared MIME type; HEIC/HEIF from some camera apps is not accepted and must be converted to one of these formats by the client.
+- Maximum size: 5 MB per upload. Only one file per request.
+- Responses are wrapped in the standard `{ success, data }` envelope. `data.status` is `DETECTED` (one code), `AMBIGUOUS` (several candidates, no single code) or `UNREADABLE` (no reliable code plus retry guidance). Even no-detection and ambiguous outcomes return HTTP 200; invalid uploads return 400 and OCR failures return 500.
+- Uploads are written to a uniquely named file in the OS temporary directory, processed, and deleted before the response in success, validation-failure and OCR-failure paths. Nothing is persisted in the database.
+
+Tesseract.js v7 requires Node.js 16 or newer (this project runs on Node 22). The first OCR request may download the cached English traineddata to the OS temp directory; subsequent requests reuse that local cache. No cloud OCR is used.
+
+To test with Swagger: set `ENABLE_API_DOCS=true`, start the backend, open `/docs`, click **Authorize** and supply a bearer access token from `/auth/login`, expand **OCR → POST /ocr/error-code**, click **Try it out**, choose a JPEG/PNG/WebP display image, and execute. The three possible 200 response examples are included in the spec.
+
 ## Rate limits and CORS
 
 `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_AUTH_MAX`, and `RATE_LIMIT_MESSAGE_MAX` configure the built-in in-memory limiter for auth endpoints and paid diagnosis turns. It protects a single process; use an edge/load-balancer limiter in addition for multi-instance production.

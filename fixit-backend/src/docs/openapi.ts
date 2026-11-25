@@ -26,6 +26,11 @@ export const openApiSpec = {
       description:
         'Owner-scoped diagnosis sessions and backend-controlled AI turns. Identity always comes from the access token, never from the request. Workflow: create a session, POST messages with unique requestId values, review returned knowledge/parts/progress, confirm a fix challenge or complete a terminal verdict.',
     },
+    {
+      name: 'OCR',
+      description:
+        'Local Tesseract OCR for appliance display images. Detects error-code candidates only; brand, model and serial number are never extracted. Results are advisory and must be confirmed or corrected by the user before entering the diagnosis flow.',
+    },
   ],
   components: {
     securitySchemes: {
@@ -212,6 +217,41 @@ export const openApiSpec = {
           nickname: { type: 'string', nullable: true, maxLength: 100, description: 'Trimmed by the server.' },
         },
         example: { nickname: 'Kitchen fridge' },
+      },
+      OcrDetectionData: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'Advisory OCR result. DETECTED returns one code; AMBIGUOUS returns multiple candidates with code=null; UNREADABLE returns no candidates and asks for a clearer image. ocrConfidence is Tesseract’s coarse page-level score (0-100), not the probability that code is correct. No session is created and no brand, model or serial number is extracted.',
+        required: ['status', 'code', 'candidates', 'message', 'ocrConfidence'],
+        properties: {
+          status: { type: 'string', enum: ['DETECTED', 'AMBIGUOUS', 'UNREADABLE'] },
+          code: {
+            type: 'string',
+            nullable: true,
+            maxLength: 16,
+            description: 'Normalized code only when status is DETECTED; otherwise null.',
+          },
+          candidates: {
+            type: 'array',
+            maxItems: 10,
+            items: { type: 'string', maxLength: 16 },
+            description:
+              'Distinct normalized candidates: one for DETECTED, several for AMBIGUOUS, none for UNREADABLE. More than ten candidates is reported as UNREADABLE.',
+          },
+          message: {
+            type: 'string',
+            nullable: true,
+            maxLength: 300,
+            description: 'Retry guidance for AMBIGUOUS/UNREADABLE; null when a single code was detected.',
+          },
+          ocrConfidence: {
+            type: 'number',
+            minimum: 0,
+            maximum: 100,
+            description: 'Rounded page-level OCR confidence; quality hint only, never used to choose a code.',
+          },
+        },
       },
       RegisterRequest: {
         type: 'object',
@@ -625,6 +665,64 @@ export const openApiSpec = {
             example: {
               success: false,
               error: { code: 'RATE_LIMITED', message: 'Too many requests; try again later' },
+            },
+          },
+        },
+      },
+      OcrDetectionResult: {
+        description:
+          'Structured OCR outcome. A single code, ambiguous candidates, or an unreadable-image message; always HTTP 200 when the upload itself is valid.',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['success', 'data'],
+              properties: {
+                success: { type: 'boolean', enum: [true] },
+                data: { $ref: '#/components/schemas/OcrDetectionData' },
+              },
+            },
+            examples: {
+              detected: {
+                summary: 'Single readable error code',
+                value: {
+                  success: true,
+                  data: {
+                    status: 'DETECTED',
+                    code: 'E03',
+                    candidates: ['E03'],
+                    message: null,
+                    ocrConfidence: 78,
+                  },
+                },
+              },
+              ambiguous: {
+                summary: 'Multiple possible codes; do not choose one',
+                value: {
+                  success: true,
+                  data: {
+                    status: 'AMBIGUOUS',
+                    code: null,
+                    candidates: ['E1', 'F1'],
+                    message: 'More than one possible error code was found. Please enter the code shown on the display.',
+                    ocrConfidence: 64,
+                  },
+                },
+              },
+              unreadable: {
+                summary: 'No reliable text or code',
+                value: {
+                  success: true,
+                  data: {
+                    status: 'UNREADABLE',
+                    code: null,
+                    candidates: [],
+                    message:
+                      "We couldn't clearly read the error code. Please upload a clearer image with the display text in focus.",
+                    ocrConfidence: 11,
+                  },
+                },
+              },
             },
           },
         },
@@ -1558,6 +1656,83 @@ export const openApiSpec = {
           '401': { $ref: '#/components/responses/Unauthorized' },
           '404': { $ref: '#/components/responses/SessionNotFound' },
           '409': { $ref: '#/components/responses/SessionNotCompletable' },
+        },
+      },
+    },
+    '/ocr/error-code': {
+      post: {
+        tags: ['OCR'],
+        summary: 'Detect an appliance error code from a display image',
+        description:
+          'Authenticated, local Tesseract OCR used only to find error-code candidates. It handles numeric codes (83, 01), alphabetic codes (FE, OE, dE, LE), alphanumeric codes (E03, F5, H1, E83), safely normalized casing/OCR confusions, and separated tokens such as E 03 when bounding-box evidence confirms they belong together (numeric-first text such as 83 E is never reordered). Model, serial and product identifiers, temperatures, clocks, dates and measurements are suppressed. No brand, model, serial number, session or diagnosis is created. The uploaded image is written to a uniquely named OS temporary file, processed, and deleted before the response. Accepted types: image/jpeg, image/png, image/webp (content signature is checked); maximum 5 MB. Tesseract’s page confidence is a coarse quality hint (rejecting very poor OCR) and is not a probability that the returned code is correct. Multiple different candidates return AMBIGUOUS rather than a guess; unreadable images return UNREADABLE with retry guidance. Rate limited per authenticated user. The result is advisory: the client must let the user confirm or correct the code before submitting it to diagnosis.',
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'multipart/form-data': {
+              schema: {
+                type: 'object',
+                required: ['image'],
+                properties: {
+                  image: {
+                    type: 'string',
+                    format: 'binary',
+                    description: 'Display image: JPEG, PNG or WebP, at most 5 MB.',
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': { $ref: '#/components/responses/OcrDetectionResult' },
+          '400': {
+            description:
+              'Validation error: missing image, wrong multipart field, unsupported type, content/signature mismatch, or file larger than 5 MB',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/ApiError' },
+                examples: {
+                  missing: {
+                    value: { success: false, error: { code: 'VALIDATION_ERROR', message: 'image: An image file is required' } },
+                  },
+                  type: {
+                    value: {
+                      success: false,
+                      error: { code: 'VALIDATION_ERROR', message: 'image: Only JPEG, PNG and WebP images are accepted' },
+                    },
+                  },
+                  oversized: {
+                    value: {
+                      success: false,
+                      error: { code: 'VALIDATION_ERROR', message: 'image: File too large. Maximum size is 5 MB' },
+                    },
+                  },
+                  wrongField: {
+                    value: {
+                      success: false,
+                      error: {
+                        code: 'VALIDATION_ERROR',
+                        message: "image: Only one file is accepted in the 'image' field",
+                      },
+                    },
+                  },
+                  signatureMismatch: {
+                    value: {
+                      success: false,
+                      error: {
+                        code: 'VALIDATION_ERROR',
+                        message: 'image: File content does not match a JPEG, PNG and WebP image',
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '429': { $ref: '#/components/responses/RateLimited' },
+          '500': { $ref: '#/components/responses/InternalError' },
         },
       },
     },

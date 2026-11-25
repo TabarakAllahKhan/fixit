@@ -5,6 +5,7 @@ import { healthRouter } from "./routes/health.routes.js";
 import { authRouter } from "./routes/auth.routes.js";
 import { diagnosisRouter } from "./routes/diagnosis.routes.js";
 import { applianceRouter } from "./routes/appliance.routes.js";
+import { ocrRouter } from "./routes/ocr.routes.js";
 import { docsRouter } from "./docs/swagger.js";
 import { corsMiddleware } from "./middleware/cors.js";
 import { notFound } from "./middleware/notFound.js";
@@ -23,6 +24,7 @@ app.use("/health", healthRouter);
 app.use("/auth", authRouter);
 app.use("/diagnosis", diagnosisRouter);
 app.use("/appliances", applianceRouter);
+app.use("/ocr", ocrRouter);
 
 // API documentation is opt-in so Swagger UI and the raw spec are not public by
 // accident. Set ENABLE_API_DOCS=true for local/staging documentation.

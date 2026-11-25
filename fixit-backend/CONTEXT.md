@@ -1791,3 +1791,144 @@ has been run.
   approval of one phase authorizes the next.
 - Documentation-only tasks must not change source, schema, tests, config, database records, or
   git history. Preserve pre-existing uncommitted work.
+
+## OCR Error-Code Extraction — Current Implementation
+
+**Scope and approval note (2026-11-24).** This section documents OCR code that is present in the
+current working tree, traced from `src/` and the tests listed below. It deliberately preserves
+the earlier audit statements in §3, §9, §12.2 and §12.4–§12.6 as historical records: those
+sections describe the pre-OCR snapshot in which `appliance-scan.service.ts` was an empty
+placeholder and Phase 11 was pending. This section supersedes only those historical statements
+about implementation state. It does **not** record or imply Phase 11 approval; no explicit OCR
+phase approval appears in this document, so the approval status remains unchanged.
+
+### Implemented endpoint and request pipeline
+
+- **Endpoint:** `POST /ocr/error-code`, mounted by `src/app.ts` as `/ocr` → `src/routes/ocr.routes.ts`.
+- **Middleware order:** `corsMiddleware` and `express.json` on the app, then `requireAuth`, the
+  dedicated `ocrRateLimit`, `uploadImage`, `validateImageFile`, and finally
+  `scanErrorCode` in `src/controllers/ocr.controller.ts`. Authentication runs before the upload
+  is parsed so anonymous callers cannot consume a rate-limit bucket.
+- **Authentication:** `requireAuth` requires an `Authorization: Bearer <token>` header, verifies
+  the access token with `verifyAccessToken`, and attaches only the internal `req.user.id`. A
+  missing header or non-Bearer scheme produces `401 UNAUTHORIZED`; an invalid/expired token is
+  forwarded as an `HttpError` and serialized by `errorHandler` with the same status and code.
+- **Rate limiting:** `ocrRateLimit` is an in-memory, per-process fixed-window limiter named
+  `ocr-scan`, keyed by `req.user.id`. It reuses `env.RATE_LIMIT_AUTH_MAX` (default 30 requests)
+  and `env.RATE_LIMIT_WINDOW_MS` (default 60 000 ms). Exceeding it returns `429 RATE_LIMITED`
+  with `RateLimit-Limit`, `RateLimit-Remaining`, and `Retry-After` headers. It can be disabled
+  with `RATE_LIMIT_ENABLED=false` outside production; production forbids disabling it.
+- **Multipart contract:** exactly one file in the field named `image`; no JSON body validation is
+  involved. The image is written with multer disk storage to the OS temp directory as
+  `fixit-ocr-<uuid>.<extension>`. Accepted types are `image/jpeg`, `image/png`, and `image/webp`,
+  with a 5 MB (`5 * 1024 * 1024` bytes) maximum and `files: 1`.
+- **Validation behavior:** multer's `fileFilter` rejects unsupported MIME types; `LIMIT_FILE_SIZE`
+  rejects oversized uploads; `LIMIT_UNEXPECTED_FILE`/`LIMIT_FILE_COUNT` rejects wrong fields or
+  multiple files. `validateImageFile` rejects a missing `image` file and also reads the uploaded
+  bytes to check the magic-byte signature against the declared MIME type (JPEG `FF D8 FF`, PNG
+  eight-byte PNG signature, WebP `RIFF`/`WEBP`). These are `400 VALIDATION_ERROR` responses with
+  distinct messages; they are not all identical. Authentication, rate-limit, and unexpected
+  server failures use their own `401`, `429`, and `500` error codes.
+
+### Implemented OCR engine and extraction
+
+- **Local engine:** `src/services/appliance-scan.service.ts` uses `tesseract.js` declared as
+  `^7.0.0` in `package.json`. `recognizeErrorCode` creates one worker per request with language
+  `eng`, `Tesseract.OEM.LSTM_ONLY`, and
+  `cachePath: join(tmpdir(), 'fixit-ocr-tessdata')`. It sets
+  `tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT` (`11`) and calls
+  `worker.recognize(filePath, {}, { blocks: true })`. The worker is terminated in a `finally`
+  block on both successful and failed recognition; worker-startup failure has no worker to
+  terminate. No external AI/vision provider is contacted.
+- **PSM choice:** the source records that PSM 3, 6, 7, 8, and 11 were compared on representative
+  images. PSM 6, 7, and 11 gave identical outcomes; PSM 3 produced the same tokens and boxes but
+  weaker confidence on separated text, and PSM 8 regressed separated tokens and two-code images.
+  PSM 11 was retained. This is not per-image tuning.
+- **Evidence model:** `buildOcrEvidence` keeps raw text, a clamped/rounded 0–100 page confidence,
+  and block/line/word boxes, symbol confidences, and Tesseract word choices internally. When
+  usable block metadata is absent it falls back to tokenizing raw text; fallback tokens carry no
+  spatial evidence and cannot unlock spatial-only rules.
+- **Generalized code families and examples:** canonical `E`/`F` plus a one-to-three-digit tail
+  (`E1`, `E03`, `E123`, `F5`, `F012`) and two-letter forms (`FE`, `OE`); extended prefixes `H`,
+  `C`, `P`, `U`, `A`, `L`, `O` with digits (`H1`, `C5`, `P3`, `U2`, `A4`) and meaningful two-letter
+  forms such as `dE`, `LE`, `HE`, `CE`; numeric two-to-three-digit codes (`83`, `01`, `123`) when
+  strongly evidenced; and separated prefix-plus-digit tokens (`E 03`, `F 5`, `H 123`) only when
+  reading order, horizontal gap, and vertical alignment agree. No manufacturer-specific catalogue
+  is consulted.
+- **Normalization and ambiguity:** position-aware digit confusions (`O`, `I`, `L`, `S`, `B`, `Z`,
+  `G`) are applied only in a digit tail, at most once per reading. Safe casing variants are
+  normalized, with `dE` deliberately preserved. Tesseract alternatives are considered only when
+  their confidence is at least 20 and within 15 points of the top reading; each alternative must
+  itself be a valid code. Repeated readings are deduplicated.
+- **Confidence gates:** `MIN_PAGE_CONFIDENCE = 20`, `MIN_WORD_CONFIDENCE = 40`,
+  `MIN_NUMERIC_CONFIDENCE = 60`, `CHOICE_CONFIDENCE_FLOOR = 20`,
+  `CHOICE_CONFIDENCE_GAP = 15`, and `MAX_CANDIDATES = 10`. Separated-token geometry uses a
+  maximum gap ratio of 1.25 and misalignment ratio of 0.6. These are absolute evidence filters,
+  not a ranking: candidates with weak word or symbol confidence are removed before the final
+  decision, and excessive candidates become UNREADABLE rather than a guess.
+- **False-positive safeguards:** identifier labels and long model/serial-like tokens suppress
+  nearby candidates; short state/setting words, units, temperatures, clocks, dates, and
+  measurements are rejected; numeric candidates need isolation or explicit error wording and
+  stronger confidence than letter-led codes. Tokens separated by large gaps, different lines, or
+  visibly misaligned baselines are not composed.
+- **Outcomes:** `UNREADABLE` when no reliable candidate survives (or evidence/candidate gates
+  fail), `AMBIGUOUS` when several reliable candidates or multiple plausible variants remain, and
+  `DETECTED` when exactly one reliable candidate with one variant remains. The first two return a
+  user-facing guidance message; `DETECTED` has `message: null`.
+- **Response envelope:** every valid upload returns HTTP 200 with
+  `{ success: true, data: { status, code, candidates, message, ocrConfidence } }`. `code` is a
+  string for `DETECTED` and `null` otherwise; `candidates` is `[code]` for `DETECTED`, up to ten
+  strings for `AMBIGUOUS`, and empty for `UNREADABLE`. `ocrConfidence` is Tesseract's clamped and
+  rounded page-level confidence (0–100). It is a coarse OCR-quality hint and diagnostic gate,
+  **not** a probability that the returned code is correct, and it is never used to rank or choose
+  among candidate codes. Client-safe failures instead use
+  `{ success: false, error: { code, message } }`.
+- **Temporary-file cleanup:** `validateImageFile` unlinks a file immediately when its signature
+  does not match the declared MIME type. For files that reach the controller,
+  `scanErrorCode` awaits `unlink(file.path)` in a `finally` block after success or service
+  failure, so OCR errors still remove the upload; `ENOENT` is ignored and other unlink errors are
+  logged as warnings. Multer error mapping paths (wrong field, oversize, unsupported MIME) do not
+  contain an explicit unlink call.
+- **Documentation availability:** the OCR path, request contract, and `DETECTED`/`AMBIGUOUS`/
+  `UNREADABLE` examples are in `src/docs/openapi.ts`. Swagger UI at `/docs` and the raw spec at
+  `/docs/openapi.json` are mounted only when `ENABLE_API_DOCS=true`; they are not public by
+  default.
+
+### Accepted limitations and trade-offs
+
+- OCR is **advisory only**. The client must let the user confirm or correct the suggested code
+  before it is used in diagnosis.
+- Numeric-prefix formats such as `1E`, `2F`, and `83E` are currently unsupported.
+- The numeric-first separated form `83 E` is intentionally not composed or reordered into `E83`.
+- Some legitimate codes may return `UNREADABLE` because the confidence gates deliberately favor
+  avoiding false positives over maximizing recall.
+- No image preprocessing or enhancement is implemented; recognition depends on the uploaded
+  display image and Tesseract's page segmentation.
+- OCR does not identify appliance brand, model, or serial number. Those values remain manual
+  user inputs.
+- OCR does not validate a candidate against a manufacturer catalogue, resolve its meaning, or
+  perform diagnosis. No database row or diagnosis session is created by this endpoint.
+- Numeric-only codes require spatial isolation or explicit error context to be accepted,
+  reducing false positives from temperatures, clocks, dates, counters, and measurements.
+- Preserved investigation note: the earlier `1e.png` investigation produced **empty raw OCR
+  text, zero page confidence, and no words or symbols**. That was a recognition failure, not
+  proof that Tesseract recognized `1E` and the extractor rejected it. It is carried forward as
+  investigation history, not as a current passing or failing test result.
+- Rate limiting is process-local in memory; it is not shared across instances and resets on
+  restart.
+
+### Possible future improvement, not implemented
+
+Numeric-prefix support could be revisited, but only with real OCR evidence for the numeric-first
+text actually emitted by Tesseract and explicit collision tests against ordinary numeric display
+values. No such support, evidence requirement, or test is implemented by this code.
+
+### Tests and validation record
+
+The working tree contains `tests/http/ocr.routes.test.ts`, `tests/services/appliance-scan.service.test.ts`,
+`tests/services/error-code-extraction.test.ts`, `tests/dependencies/tesseract.test.ts`, and
+`tests/docs/ocr.openapi.test.ts`. They cover authentication and validation envelopes, HTTP
+outcomes and temp-file deletion, worker configuration and termination, generalized extraction and
+false-positive cases, the Tesseract.js API constants, and the OpenAPI contract. This
+documentation-only update does not run tests and does not claim a pass/fail result or new phase
+approval.
