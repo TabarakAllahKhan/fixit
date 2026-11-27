@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Keyboard, StyleSheet, Text, View } from 'react-native';
+import { Keyboard, Pressable, Text, View } from 'react-native';
 import { Link } from 'expo-router';
 import { AuthPrimaryButton } from '@/components/auth/AuthPrimaryButton';
 import { AuthScreenShell } from '@/components/auth/AuthScreenShell';
 import { AuthTextField, PasswordField, type AuthTextInputRef } from '@/components/auth/AuthTextField';
 import { FormMessage } from '@/components/auth/FormMessage';
-import { colors, fontFamily } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/lib/api';
 import { getAuthErrorMessage } from '@/lib/auth-error';
@@ -97,10 +96,18 @@ export default function SignupScreen() {
   }
 
   const footer = (
-    <View style={styles.footerRow}>
-      <Text style={styles.footerText}>Already have an account? </Text>
-      <Link href="/login" style={styles.footerLink}>
-        Sign in
+    <View className="flex-row flex-wrap items-center justify-center gap-x-1">
+      <Text className="font-manrope text-[14px] leading-5 text-secondary">
+        Already have an account?{' '}
+      </Text>
+      <Link href="/login" asChild>
+        <Pressable
+          accessibilityRole="link"
+          accessibilityLabel="Sign in"
+          style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
+        >
+          <Text className="font-manrope-semibold text-[14px] leading-5 text-primary">Sign in</Text>
+        </Pressable>
       </Link>
     </View>
   );
@@ -120,13 +127,13 @@ export default function SignupScreen() {
 
   return (
     <AuthScreenShell
-      eyebrow="Create account"
-      title="Start fixing with confidence"
-      subtitle="Create an account to save appliances and keep track of your repairs."
+      eyebrow="Get started"
+      title="Create Account"
+      subtitle="Set up your Fix-It account."
       footer={footer}
     >
       <AuthTextField
-        label="Email address"
+        label="Email"
         value={email}
         onChangeText={(value) => {
           setEmail(value);
@@ -157,8 +164,7 @@ export default function SignupScreen() {
           clearFormError();
         }}
         error={errors.username}
-        helper="3–30 characters: letters, numbers, dots, underscores or hyphens."
-        placeholder="homefixer"
+        placeholder="yourname"
         icon="account-outline"
         autoComplete="username"
         textContentType="username"
@@ -180,8 +186,7 @@ export default function SignupScreen() {
           clearFormError();
         }}
         error={errors.password}
-        helper="Use at least 8 characters."
-        placeholder="Create a password"
+        placeholder="At least 8 characters"
         autoComplete="new-password"
         textContentType="newPassword"
         returnKeyType="done"
@@ -192,7 +197,7 @@ export default function SignupScreen() {
       {formError ? <FormMessage message={formError} /> : null}
 
       <AuthPrimaryButton
-        label="Create account"
+        label="Create Account"
         loadingLabel="Creating account…"
         loading={submitting}
         onPress={() => void handleSubmit()}
@@ -200,24 +205,3 @@ export default function SignupScreen() {
     </AuthScreenShell>
   );
 }
-
-const styles = StyleSheet.create({
-  footerRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'baseline',
-    justifyContent: 'center',
-  },
-  footerText: {
-    fontFamily: fontFamily.regular,
-    fontSize: 14,
-    lineHeight: 20,
-    color: colors.secondary,
-  },
-  footerLink: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 14,
-    lineHeight: 20,
-    color: colors.primary,
-  },
-});

@@ -1,6 +1,6 @@
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { colors, fontFamily, radius, spacing } from '@/constants/theme';
+import { colors } from '@/constants/theme';
 
 interface Props {
   label: string;
@@ -22,26 +22,29 @@ export function AuthPrimaryButton({
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={label}
+      accessibilityLabel={loading ? loadingLabel : label}
       accessibilityState={{ disabled: isDisabled, busy: loading }}
       disabled={isDisabled}
       onPress={onPress}
       android_ripple={isDisabled ? undefined : { color: colors.primaryPressed }}
-      style={({ pressed }) => [
-        styles.button,
-        isDisabled && styles.disabled,
-        pressed && !isDisabled && styles.pressed,
-      ]}
+      className={`min-h-[56px] w-full items-center justify-center rounded-[14px] px-5 ${
+        isDisabled ? 'bg-line' : 'bg-primary'
+      }`}
+      style={({ pressed }) => (!isDisabled && pressed ? styles.pressed : undefined)}
     >
-      <View style={styles.content}>
+      <View className="flex-row items-center justify-center gap-2">
         {loading ? (
           <>
             <ActivityIndicator color={colors.white} size="small" />
-            <Text style={[styles.label, styles.disabledLabel]}>{loadingLabel}</Text>
+            <Text className="font-manrope-semibold text-[16px] leading-5 text-surface">
+              {loadingLabel}
+            </Text>
           </>
         ) : (
           <>
-            <Text style={styles.label}>{label}</Text>
+            <Text className="font-manrope-semibold text-[16px] leading-5 text-surface">
+              {label}
+            </Text>
             <Ionicons name="arrow-forward" size={18} color={colors.white} />
           </>
         )}
@@ -51,33 +54,8 @@ export function AuthPrimaryButton({
 }
 
 const styles = StyleSheet.create({
-  button: {
-    minHeight: 52,
-    borderRadius: radius.md,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: spacing.lg,
-  },
   pressed: {
     backgroundColor: colors.primaryPressed,
-  },
-  disabled: {
-    backgroundColor: colors.border,
-  },
-  content: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.sm,
-  },
-  label: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 16,
-    lineHeight: 20,
-    color: colors.white,
-  },
-  disabledLabel: {
-    color: colors.secondary,
+    transform: [{ scale: 0.985 }],
   },
 });

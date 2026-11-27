@@ -1,6 +1,6 @@
-import { StyleSheet, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
 import MaterialCommunityIcons from '@expo/vector-icons/MaterialCommunityIcons';
-import { colors, fontFamily } from '@/constants/theme';
+import { colors } from '@/constants/theme';
 
 interface Props {
   message: string;
@@ -11,24 +11,27 @@ interface Props {
 export function FormMessage({ message, tone, type }: Props) {
   const resolved = tone ?? type ?? 'error';
   const isError = resolved === 'error';
+
   return (
-    <View accessibilityRole="alert" style={[styles.wrap, isError ? styles.errorWrap : styles.successWrap]}>
+    <View
+      accessibilityRole="alert"
+      className={`flex-row items-start gap-2.5 rounded-[14px] border px-3.5 py-3 ${
+        isError ? 'border-line bg-error-soft' : 'border-line bg-primary-soft'
+      }`}
+    >
       <MaterialCommunityIcons
         name={isError ? 'alert-circle-outline' : 'check-circle-outline'}
         size={18}
         color={isError ? colors.error : colors.success}
       />
-      <Text style={[styles.text, isError ? styles.errorText : styles.successText]}>{message}</Text>
+      <Text
+        className={`flex-1 font-manrope-medium text-[14px] leading-5 ${
+          isError ? 'text-error' : 'text-success'
+        }`}
+      >
+        {message}
+      </Text>
     </View>
   );
 }
 export const AuthMessage = FormMessage;
-
-const styles = StyleSheet.create({
-  wrap: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, paddingHorizontal: 14, paddingVertical: 12, borderRadius: 14, borderWidth: 1 },
-  errorWrap: { backgroundColor: colors.errorSoft, borderColor: '#F2CFCB' },
-  successWrap: { backgroundColor: '#EEF7F2', borderColor: '#CFE6DA' },
-  text: { flex: 1, fontFamily: fontFamily.medium, fontSize: 14, lineHeight: 20 },
-  errorText: { color: '#A9443D' },
-  successText: { color: colors.success },
-});

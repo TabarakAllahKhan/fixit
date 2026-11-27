@@ -9,12 +9,26 @@ export function normalizeUsername(value: string): string {
   return value.trim().toLowerCase();
 }
 
+export function isEmailIdentifier(value: string): boolean {
+  return value.includes('@');
+}
+
 export function validateEmail(value: string): string | null {
   const email = normalizeEmail(value);
   if (!email) return 'Enter your email address.';
   if (email.length > 254) return 'Email address is too long.';
   if (!EMAIL_PATTERN.test(email)) return 'Enter a valid email address.';
   return null;
+}
+
+export function validateLoginIdentifier(value: string): string | null {
+  const identifier = value.trim();
+  if (!identifier) return 'Enter your email or username.';
+  if (isEmailIdentifier(identifier)) return validateEmail(identifier);
+
+  const usernameError = validateUsername(identifier);
+  if (usernameError === 'Choose a username.') return 'Enter your email or username.';
+  return usernameError;
 }
 
 export function validateUsername(value: string): string | null {

@@ -1,15 +1,17 @@
-import type { ReactNode } from 'react';
+import { type ReactNode } from 'react';
 import {
+  Dimensions,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
 } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Image } from 'expo-image';
-import { colors, fontFamily, spacing, type as typography } from '@/constants/theme';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { AuthLogoAnimation } from '@/components/auth/AuthLogoAnimation';
+import { colors } from '@/constants/theme';
 
 interface Props {
   eyebrow: string;
@@ -19,47 +21,77 @@ interface Props {
   children: ReactNode;
 }
 
+const MAX_CONTENT_WIDTH = 440;
+
+/**
+ * Shared Login/Signup shell. The animated Fix-It logo is horizontally centered
+ * in a stable top slot and keeps its size when the keyboard opens. Android uses
+ * keyboard padding so the submit button stays reachable. The logo component
+ * owns playback and reduced-motion behavior.
+ */
 export function AuthScreenShell({ eyebrow, title, subtitle, footer, children }: Props) {
-  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const shortViewport = Dimensions.get('screen').height < 720;
+  const horizontalPadding = Math.min(24, Math.max(20, Math.round(width * 0.06)));
+  const logoSize = shortViewport ? 112 : 128;
+  const headerGap = shortViewport ? 18 : 24;
+  const sectionGap = shortViewport ? 14 : 18;
+  const topPadding = shortViewport ? 12 : 20;
+  const bottomPadding = shortViewport ? 20 : 28;
 
   return (
-    <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
+    <SafeAreaView style={styles.safe} edges={['top', 'bottom', 'left', 'right']}>
       <KeyboardAvoidingView
         style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'android' ? 'padding' : undefined}
       >
         <ScrollView
           style={styles.flex}
           contentContainerStyle={[
-            styles.content,
-            { paddingBottom: Math.max(insets.bottom, spacing.lg) + spacing.xl },
+            styles.scrollContent,
+            {
+              paddingHorizontal: horizontalPadding,
+              paddingTop: topPadding,
+              paddingBottom: bottomPadding,
+            },
           ]}
           keyboardShouldPersistTaps="handled"
+          keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
           bounces={false}
+          automaticallyAdjustKeyboardInsets={Platform.OS === 'ios'}
           showsVerticalScrollIndicator={false}
         >
-          <View style={styles.inner}>
-            <View style={styles.brandRow}>
-              <Image
-                source={require('@/assets/images/splash-icon.png')}
-                style={styles.mark}
-                contentFit="contain"
-                accessibilityLabel="Fix-It logo"
-              />
-              <View style={styles.brandText}>
-                <Text style={styles.brandName}>Fix-It</Text>
-                <Text style={styles.brandTag}>Appliance care, made clear</Text>
+          <View style={styles.content}>
+            <AuthLogoAnimation size={logoSize} />
+
+            <View style={{ marginTop: headerGap }}>
+              <Text className="font-manrope-semibold text-[12px] uppercase leading-4 tracking-[1px] text-primary">
+                {eyebrow}
+              </Text>
+              <Text className="mt-2 font-manrope-bold text-[30px] leading-[36px] tracking-[-0.7px] text-heading">
+                {title}
+              </Text>
+              <Text className="mt-2 font-manrope text-[15px] leading-[22px] text-secondary">
+                {subtitle}
+              </Text>
+
+              <View style={{ marginTop: sectionGap, gap: shortViewport ? 12 : 14 }}>
+                {children}
               </View>
+
+              {footer ? (
+                <View
+                  style={{
+                    marginTop: sectionGap,
+                    paddingTop: sectionGap,
+                    borderTopWidth: StyleSheet.hairlineWidth,
+                    borderTopColor: colors.border,
+                  }}
+                >
+                  {footer}
+                </View>
+              ) : null}
             </View>
-
-            <View style={styles.accentBar} />
-            <Text style={styles.eyebrow}>{eyebrow}</Text>
-            <Text style={styles.title}>{title}</Text>
-            <Text style={styles.subtitle}>{subtitle}</Text>
-
-            <View style={styles.form}>{children}</View>
-
-            {footer ? <View style={styles.footer}>{footer}</View> : null}
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -68,85 +100,18 @@ export function AuthScreenShell({ eyebrow, title, subtitle, footer, children }: 
 }
 
 const styles = StyleSheet.create({
-  flex: {
-    flex: 1,
-  },
+  flex: { flex: 1 },
   safe: {
     flex: 1,
     backgroundColor: colors.background,
   },
-  content: {
+  scrollContent: {
     flexGrow: 1,
-    paddingHorizontal: spacing.screen,
-    paddingTop: spacing.xl,
   },
-  inner: {
+  content: {
     width: '100%',
-    maxWidth: 460,
+    maxWidth: MAX_CONTENT_WIDTH,
     alignSelf: 'center',
-  },
-  brandRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.md,
-    marginBottom: spacing.xxl,
-  },
-  mark: {
-    width: 42,
-    height: 42,
-  },
-  brandText: {
-    flex: 1,
-  },
-  brandName: {
-    fontFamily: fontFamily.bold,
-    fontSize: 21,
-    lineHeight: 25,
-    letterSpacing: -0.4,
-    color: colors.heading,
-  },
-  brandTag: {
-    fontFamily: fontFamily.medium,
-    fontSize: 13,
-    lineHeight: 18,
-    color: colors.secondary,
-    marginTop: 1,
-  },
-  accentBar: {
-    width: 40,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: colors.accent,
-    marginBottom: spacing.lg,
-  },
-  eyebrow: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 12,
-    lineHeight: 16,
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-    color: colors.primary,
-    marginBottom: spacing.sm,
-  },
-  title: {
-    ...typography.title,
-    fontSize: 30,
-    lineHeight: 36,
-    letterSpacing: -0.7,
-    marginBottom: spacing.sm,
-  },
-  subtitle: {
-    ...typography.subtitle,
-    maxWidth: 340,
-  },
-  form: {
-    marginTop: spacing.xxl,
-    gap: spacing.lg,
-  },
-  footer: {
-    marginTop: spacing.xxl,
-    paddingTop: spacing.lg,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
+    flexGrow: 1,
   },
 });
