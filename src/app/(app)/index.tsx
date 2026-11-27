@@ -1,102 +1,66 @@
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useCallback, useState } from 'react';
+import { ScrollView, StyleSheet } from 'react-native';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { ActiveDiagnosisCard } from '@/components/home/ActiveDiagnosisCard';
+import { ApplianceSection } from '@/components/home/ApplianceSection';
+import { HomeHeader } from '@/components/home/HomeHeader';
+import { RecentDiagnosisSection } from '@/components/home/RecentDiagnosisSection';
+import { ScanHero } from '@/components/home/ScanHero';
+import { colors, spacing } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
-import { colors, fontFamily } from '@/constants/theme';
+import { useHomeData } from '@/hooks/useHomeData';
+import { getGreeting } from '@/lib/home-presentation';
 
 export default function Home() {
   const router = useRouter();
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
+  const { appliances, diagnoses, refresh } = useHomeData();
+  const [greeting, setGreeting] = useState(() => getGreeting());
+
+  useFocusEffect(
+    useCallback(() => {
+      setGreeting(getGreeting());
+    }, []),
+  );
+
+  const openScan = useCallback(() => router.push('/scan'), [router]);
+  const openAddAppliance = useCallback(() => router.push('/appliances/new'), [router]);
+  const openAppliances = useCallback(() => router.push('/appliances'), [router]);
+  const openDiagnosis = useCallback((id: string) => router.push(`/diagnose/${id}`), [router]);
+  const openProfile = useCallback(() => router.push('/profile'), [router]);
+
+  const activeDiagnosis = diagnoses.items.find((session) => session.status === 'OPEN') ?? null;
 
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.eyebrow}>Fix-It</Text>
-        <Text style={styles.title}>Is it a 5-minute fix?</Text>
-        <Text style={styles.sub}>
-          Snap the model sticker or the error display, then get clear next steps.
-        </Text>
-      </View>
-
-      <Pressable
-        accessibilityRole="button"
-        onPress={() => router.push('/scan')}
-        style={({ pressed }) => [styles.primaryAction, pressed && styles.primaryActionPressed]}
-      >
-        <Text style={styles.primaryActionText}>Scan sticker / error code</Text>
-      </Pressable>
-
-      <View style={styles.accountCard}>
-        <Text style={styles.accountLabel}>Signed in as</Text>
-        <Text style={styles.accountValue}>{user?.email ?? 'your account'}</Text>
-        <Pressable accessibilityRole="button" onPress={() => void signOut()} hitSlop={8}>
-          <Text style={styles.signOut}>Sign out</Text>
-        </Pressable>
-      </View>
-    </View>
+    <SafeAreaView style={styles.safe} edges={['top', 'left', 'right', 'bottom']}>
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        <HomeHeader user={user} greeting={greeting} onOpenProfile={openProfile} />
+        <ScanHero onScan={openScan} onAddAppliance={openAddAppliance} />
+        <ActiveDiagnosisCard
+          session={activeDiagnosis}
+          loading={diagnoses.loading}
+          error={diagnoses.error}
+          onResume={openDiagnosis}
+          onRetry={refresh}
+        />
+        <ApplianceSection
+          section={appliances}
+          onAdd={openAddAppliance}
+          onSeeAll={openAppliances}
+          onRetry={refresh}
+        />
+        <RecentDiagnosisSection section={diagnoses} onSelect={openDiagnosis} onRetry={refresh} />
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.background, padding: 24, gap: 20 },
-  header: { gap: 8, paddingTop: 8 },
-  eyebrow: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 13,
-    lineHeight: 18,
-    color: colors.primary,
-    textTransform: 'uppercase',
-    letterSpacing: 0.3,
-  },
-  title: {
-    fontFamily: fontFamily.bold,
-    fontSize: 32,
-    lineHeight: 38,
-    letterSpacing: -0.8,
-    color: colors.heading,
-  },
-  sub: {
-    fontFamily: fontFamily.regular,
-    fontSize: 16,
-    lineHeight: 24,
-    color: colors.secondary,
-  },
-  primaryAction: {
-    minHeight: 54,
-    borderRadius: 16,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 20,
-  },
-  primaryActionPressed: { backgroundColor: colors.primaryPressed },
-  primaryActionText: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 16,
-    color: colors.white,
-  },
-  accountCard: {
-    marginTop: 'auto',
-    padding: 18,
-    borderRadius: 16,
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
-    gap: 4,
-  },
-  accountLabel: {
-    fontFamily: fontFamily.medium,
-    fontSize: 13,
-    color: colors.secondary,
-  },
-  accountValue: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 15,
-    color: colors.heading,
-  },
-  signOut: {
-    marginTop: 8,
-    fontFamily: fontFamily.semiBold,
-    fontSize: 14,
-    color: colors.primary,
+  safe: { flex: 1, backgroundColor: colors.canvas },
+  content: {
+    paddingHorizontal: spacing.screen,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.xxl,
   },
 });

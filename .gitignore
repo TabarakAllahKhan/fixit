@@ -47,4 +47,4 @@ example
 .env.*
 !.env.example
 /mockups
-lotte.json
+.opencode

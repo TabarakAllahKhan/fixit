@@ -12,9 +12,11 @@ export default function AppLayout() {
         contentStyle: { backgroundColor: colors.background },
       }}
     >
-      <Stack.Screen name="index" options={{ title: 'Fix-It' }} />
+      <Stack.Screen name="index" options={{ title: 'Fix-It', headerShown: false }} />
       <Stack.Screen name="scan" options={{ title: 'Scan sticker' }} />
       <Stack.Screen name="appliances" options={{ title: 'Appliances' }} />
+      <Stack.Screen name="appliances/new" options={{ title: 'New appliance' }} />
+      <Stack.Screen name="profile" options={{ title: 'Profile' }} />
       <Stack.Screen name="diagnose/[id]" options={{ title: 'Diagnosis' }} />
     </Stack>
   );
