@@ -90,7 +90,16 @@ function createSessionRequest(token: string, body: object) {
   return request(app).post('/diagnosis').set('Authorization', bearer(token)).send(body);
 }
 
-const SESSION_KEYS = ['id', 'applianceId', 'symptom', 'status', 'verdict', 'createdAt', 'updatedAt'];
+const SESSION_KEYS = [
+  'id',
+  'applianceId',
+  'symptom',
+  'errorCode',
+  'status',
+  'verdict',
+  'createdAt',
+  'updatedAt',
+];
 const MESSAGE_KEYS = ['id', 'sessionId', 'role', 'content', 'createdAt'];
 const HIDDEN_SESSION_FIELDS = [
   'userId',
@@ -128,6 +137,7 @@ describe('POST /diagnosis — creation, ownership and the initial message', () =
     expect(data).toMatchObject({
       applianceId: appliance.id,
       symptom: 'Not draining',
+      errorCode: null,
       status: SessionStatus.OPEN,
       verdict: null,
     });
@@ -136,6 +146,7 @@ describe('POST /diagnosis — creation, ownership and the initial message', () =
 
     const stored = await prisma.diagnosisSession.findUniqueOrThrow({ where: { id: data.id as string } });
     expect(stored.userId).toBe(user.id);
+    expect(stored.errorCode).toBeNull();
     expect(stored.errorCodeId).toBeNull();
     expect(stored.fixConfirmationChallengeId).toBeNull();
     expect(stored.fixConfirmationIssuedAt).toBeNull();
@@ -147,35 +158,89 @@ describe('POST /diagnosis — creation, ownership and the initial message', () =
     expect(messages[0]).toMatchObject({ role: MessageRole.USER, content: 'Not draining' });
   });
 
-  it('maps both starting clues into the initial message without a knowledge lookup', async () => {
+  it('persists the user-entered error code as text and maps both clues into the initial message', async () => {
     const { appliance, accessToken } = await owner();
     const both = await createSessionRequest(accessToken, {
       applianceId: appliance.id,
-      symptom: 'Not draining',
-      errorCode: 'FE',
+      symptom: '  Not draining  ',
+      errorCode: '  FE  ',
     });
     expect(both.status).toBe(201);
     const bothSession = successData(both.body);
+    expect(bothSession).toMatchObject({ symptom: 'Not draining', errorCode: 'FE' });
     const bothMessages = await prisma.message.findMany({
       where: { sessionId: bothSession.id as string },
     });
     expect(bothMessages).toHaveLength(1);
     expect(bothMessages[0]?.content).toBe('Not draining\nFE');
 
-    const codeOnly = await createSessionRequest(accessToken, {
+    const stored = await prisma.diagnosisSession.findUniqueOrThrow({
+      where: { id: bothSession.id as string },
+    });
+    expect(stored.symptom).toBe('Not draining');
+    expect(stored.errorCode).toBe('FE');
+    expect(stored.errorCodeId).toBeNull();
+  });
+
+  it('requires the symptom and rejects an error-code-only request', async () => {
+    const { appliance, accessToken } = await owner();
+    const response = await createSessionRequest(accessToken, {
       applianceId: appliance.id,
       errorCode: 'E1',
     });
-    expect(codeOnly.status).toBe(201);
-    const codeSession = successData(codeOnly.body);
-    expect(codeSession.symptom).toBeNull();
-    const codeMessages = await prisma.message.findMany({
-      where: { sessionId: codeSession.id as string },
-    });
-    expect(codeMessages[0]?.content).toBe('E1');
 
-    const sessions = await prisma.diagnosisSession.findMany({ where: { applianceId: appliance.id } });
-    expect(sessions.every((session) => session.errorCodeId === null)).toBe(true);
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+    expect(await prisma.diagnosisSession.count()).toBe(0);
+  });
+
+  it('creates and links a new owned appliance from inline brand/model input atomically', async () => {
+    const { user, accessToken } = await owner();
+    const response = await createSessionRequest(accessToken, {
+      brand: '  InlineBrand  ',
+      modelNumber: '  INLINE-1  ',
+      symptom: '  Not draining  ',
+      errorCode: 'FE',
+      userId: '00000000-0000-7000-8000-0000000000ff',
+      errorCodeId: '00000000-0000-7000-8000-0000000000ee',
+    });
+
+    expect(response.status).toBe(201);
+    const data = successData(response.body);
+    expect(Object.keys(data).sort()).toEqual([...SESSION_KEYS].sort());
+    expect(data).toMatchObject({ symptom: 'Not draining', errorCode: 'FE' });
+    expectNoFields(data, HIDDEN_SESSION_FIELDS);
+
+    const stored = await prisma.diagnosisSession.findUniqueOrThrow({ where: { id: data.id as string } });
+    expect(stored.userId).toBe(user.id);
+    expect(stored.errorCodeId).toBeNull();
+    const savedAppliance = await prisma.appliance.findUniqueOrThrow({
+      where: { id: stored.applianceId as string },
+    });
+    expect(savedAppliance).toMatchObject({
+      userId: user.id,
+      brand: 'InlineBrand',
+      modelNumber: 'INLINE-1',
+      category: null,
+      nickname: null,
+    });
+    const messages = await prisma.message.findMany({ where: { sessionId: stored.id } });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ role: MessageRole.USER, content: 'Not draining\nFE' });
+  });
+
+  it('rejects both identification paths supplied together', async () => {
+    const { appliance, accessToken } = await owner();
+    const response = await createSessionRequest(accessToken, {
+      applianceId: appliance.id,
+      brand: 'OtherBrand',
+      symptom: 'Not draining',
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+    expect(await prisma.appliance.count()).toBe(1);
+    expect(await prisma.diagnosisSession.count()).toBe(0);
   });
 
   it('rejects a missing appliance and another user’s appliance identically', async () => {
@@ -219,7 +284,12 @@ describe('POST /diagnosis — creation, ownership and the initial message', () =
   it('rolls back session and message when the transaction fails mid-way', async () => {
     const { user, appliance } = await owner();
     await expect(
-      createSession(user.id, { applianceId: appliance.id, symptom: 'broken\u0000clue' }),
+      createSession(user.id, {
+        applianceId: appliance.id,
+        modelNumber: null,
+        errorCode: null,
+        symptom: 'broken\u0000clue',
+      }),
     ).rejects.toThrow();
 
     expect(await prisma.diagnosisSession.count({ where: { applianceId: appliance.id } })).toBe(0);

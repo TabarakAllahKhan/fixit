@@ -1,5 +1,6 @@
 import { prisma } from '../config/prisma.js';
 import { ReviewStatus, SafetyClass } from '../generated/prisma/client.js';
+import type { ApplianceCategory } from '../generated/prisma/enums.js';
 import type {
   CitationDto,
   KnowledgeDto,
@@ -11,7 +12,9 @@ import type {
 // never grant those permissions to the model.
 
 export type KnowledgeApplianceContext = {
-  category: 'WASHING_MACHINE' | 'REFRIGERATOR';
+  // Legacy category on a trusted appliance row. Null means no reliable
+  // category match is available, not "any category".
+  category: ApplianceCategory | null;
   brand: string;
   modelScope?: 'UNSPECIFIED' | 'TOP_LOAD' | 'FRONT_LOAD' | 'FRENCH_DOOR_BOTTOM_FREEZER';
 };
@@ -59,6 +62,18 @@ export async function searchErrorCodes(
   codes: readonly string[],
   includeUnreviewed: boolean,
 ): Promise<KnowledgeDto> {
+  // UNSPECIFIED is not a wildcard here either: without a trusted category no
+  // category-specific candidates can be returned. Approval, model-scope and
+  // USER_SAFE checks below remain unchanged.
+  if (!context.category) {
+    return {
+      unverified: false,
+      errorCodes: [],
+      repairSteps: [],
+      note: 'No trusted appliance category is available; no category-specific knowledge was searched.',
+    };
+  }
+
   const uniqueCodes = [...new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean))].slice(0, 8);
   if (uniqueCodes.length === 0) {
     return { unverified: false, errorCodes: [], repairSteps: [], note: 'No error-code clue was found.' };
@@ -131,7 +146,7 @@ export async function getApprovedRepairSequence(
     },
   });
 
-  if (!code || code.category !== context.category || code.brand !== context.brand) {
+  if (!code || !context.category || code.category !== context.category || code.brand !== context.brand) {
     return { eligible: false, reason: 'The error code is not applicable to this appliance.', steps: [] };
   }
 

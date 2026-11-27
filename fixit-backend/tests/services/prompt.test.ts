@@ -16,7 +16,9 @@ describe('buildDiagnosisPrompt identity separation', () => {
   it('tells the model that only the trusted identity block is authoritative', () => {
     expect(SYSTEM_PROMPT).toMatch(/trusted appliance identity block/i);
     expect(SYSTEM_PROMPT).toMatch(/advisory diagnostic context/i);
-    expect(SYSTEM_PROMPT).toMatch(/never infer a model or configuration from a model number/i);
+    expect(SYSTEM_PROMPT).toMatch(/never invent or infer a category, brand, model or configuration/i);
+    expect(SYSTEM_PROMPT).toMatch(/household appliances/i);
+    expect(SYSTEM_PROMPT).toMatch(/when the category is null/i);
     expect(SYSTEM_PROMPT).toMatch(/reply and outcome are mandatory/i);
     expect(SYSTEM_PROMPT).toMatch(/omit optional fields/i);
     expect(SYSTEM_PROMPT).toMatch(/never claim a part is VERIFIED compatible/i);
@@ -101,6 +103,27 @@ describe('buildDiagnosisPrompt identity separation', () => {
     );
     expect(trusted).toContain('"modelScope":null');
     expect(trusted).toContain('"scopeSource":null');
+    expect(trusted).not.toContain('TOP_LOAD');
+  });
+
+  it('reports a null category without deriving scope from user text', () => {
+    const prompt = buildDiagnosisPrompt({
+      identity: identity({
+        appliance: { category: null, brand: 'AnyBrand', modelNumber: 'MODEL-1' },
+        currentUserContent: 'It is a top-load washer, model MODEL-1',
+      }),
+      context: emptyDiagnosisContext(),
+      history: [],
+      userContent: 'It is a top-load washer, model MODEL-1',
+      knowledge: { unverified: false, errorCodes: [], repairSteps: [] },
+    });
+
+    const trusted = prompt.systemInstruction.split('\n\n').find((block) =>
+      block.includes('Trusted appliance identity'),
+    );
+    expect(trusted).toContain('"category":null');
+    expect(trusted).toContain('"modelNumber":"MODEL-1"');
+    expect(trusted).toContain('"modelScope":null');
     expect(trusted).not.toContain('TOP_LOAD');
   });
 

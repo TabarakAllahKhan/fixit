@@ -1,4 +1,12 @@
 import { z } from 'zod';
+import { brandSchema, optionalTextSchema } from './text.js';
+
+// A symptom is free-form user prose, so ordinary line breaks (LF and CR) are
+// allowed. Every other C0/C1 control character, including NUL and tab, is
+// still rejected before trimming.
+const SYMPTOM_UNSAFE_CONTROL_CHARACTERS = /[\u0000-\u0009\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
+const hasNoUnsafeSymptomControlCharacters = (value: string): boolean =>
+  !SYMPTOM_UNSAFE_CONTROL_CHARACTERS.test(value);
 
 // Session IDs arrive from the client as text. Only the shape is checked here;
 // existence and ownership stay in the service layer, where the owner is derived
@@ -7,18 +15,28 @@ export const sessionIdParamSchema = z.object({
   id: z.uuid('Session ID must be a valid UUID'),
 });
 
-// The MVP keeps appliance context as a reference to a saved Appliance, so a
-// model number is not required here — older appliances may not have one.
-// At least one starting clue is required so diagnosis never begins blind.
+// Exactly one identification path is accepted: a saved appliance owned by the
+// caller, or an inline brand (with an optional model number) that the service
+// saves as a new owned appliance. Inline fields never override a saved
+// appliance. A symptom is mandatory on both paths; the error code is an
+// optional, separately persisted text clue. Unknown keys such as userId and
+// errorCodeId are stripped by Zod and can never reach the service.
 export const createSessionSchema = z
   .object({
-    applianceId: z.uuid('Appliance ID must be a valid UUID'),
-    symptom: z.string().trim().min(1, 'Symptom cannot be empty').max(2000, 'Symptom is too long').optional(),
-    errorCode: z.string().trim().min(1, 'Error code cannot be empty').max(64, 'Error code is too long').optional(),
+    applianceId: z.uuid('Appliance ID must be a valid UUID').optional(),
+    brand: brandSchema.optional(),
+    modelNumber: optionalTextSchema(80, 'Model number'),
+    errorCode: optionalTextSchema(64, 'Error code'),
+    symptom: z
+      .string()
+      .refine(hasNoUnsafeSymptomControlCharacters, 'Symptom contains control characters')
+      .trim()
+      .min(1, 'Symptom cannot be empty')
+      .max(2000, 'Symptom is too long'),
   })
-  .refine((data) => Boolean(data.symptom) || Boolean(data.errorCode), {
-    message: 'Provide at least one of symptom or errorCode',
-    path: ['symptom'],
+  .refine((data) => Boolean(data.applianceId) !== Boolean(data.brand), {
+    message: 'Provide exactly one of applianceId or brand',
+    path: ['applianceId'],
   });
 
 // Bounded offset pagination. Defaults keep the first call cheap; the upper

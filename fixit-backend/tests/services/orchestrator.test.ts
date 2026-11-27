@@ -628,6 +628,34 @@ describe('get_repair_steps backend code resolution', () => {
     expect(result.issueFixChallenge).toBe(false);
   });
 
+  it('cannot resolve repair guidance for a category-less appliance', async () => {
+    createInteractionMock
+      .mockResolvedValueOnce(completion('get_repair_steps', { errorCode: 'FE' }, 'call-repair'))
+      .mockResolvedValueOnce(
+        completion(
+          'submit_diagnosis_outcome',
+          { reply: 'No category-specific guidance is available.', outcome: 'UNRESOLVED' },
+          'call-final',
+        ),
+      );
+    // Mirrors the real knowledge service's null-category short circuit.
+    searchErrorCodesMock.mockResolvedValue(emptyKnowledge);
+
+    const result = await runDiagnosisTurn(
+      input({ identity: identity({ appliance: { category: null, brand: 'TestBrand', modelNumber: null } }) }),
+    );
+
+    expect(searchErrorCodesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ category: null, brand: 'TestBrand' }),
+      ['FE'],
+      false,
+    );
+    expect(getRepairStepsMock).not.toHaveBeenCalled();
+    expect(result.errorCodeId).toBeUndefined();
+    expect(result.issueFixChallenge).toBe(false);
+    expect(result.knowledge.repairSteps).toEqual([]);
+  });
+
   it('rejects unapproved knowledge candidates', async () => {
     const result = await runRepairStepsCall('FE', knowledgeWithCodes({ code: 'FE', trusted: false }));
 

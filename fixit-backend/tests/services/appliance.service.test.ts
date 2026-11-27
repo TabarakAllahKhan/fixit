@@ -47,6 +47,10 @@ const foreignApplianceId = '00000000-0000-4000-8000-0000000000b2';
 const createdAt = new Date('2026-11-20T00:00:00.000Z');
 const updatedAt = new Date('2026-11-20T01:00:00.000Z');
 
+const DTO_KEYS = ['id', 'brand', 'modelNumber', 'createdAt', 'updatedAt'];
+
+// The mocked row deliberately carries the legacy category/nickname columns:
+// raw Prisma records may contain them, but no DTO may expose them.
 const applianceRecord = {
   id: applianceId,
   userId,
@@ -91,10 +95,8 @@ beforeEach(() => {
 
 describe('createAppliance', () => {
   const input: CreateApplianceInput = {
-    category: ApplianceCategory.WASHING_MACHINE,
     brand: 'Bosch',
     modelNumber: 'WGG244Z0GB',
-    nickname: 'Main washer',
   };
 
   it('assigns the authenticated userId and persists only validated input', async () => {
@@ -104,14 +106,13 @@ describe('createAppliance', () => {
     expect(prisma.appliance.create).toHaveBeenCalledWith({
       data: {
         userId,
-        category: input.category,
         brand: input.brand,
         modelNumber: input.modelNumber,
-        nickname: input.nickname,
       },
       select: applianceDtoSelect,
     });
     expect(result).toEqual(toApplianceDto(applianceRecord));
+    expect(Object.keys(result).sort()).toEqual([...DTO_KEYS].sort());
   });
 
   it('returns a public DTO with no userId or raw record data', async () => {
@@ -128,9 +129,20 @@ describe('createAppliance', () => {
     expect(JSON.stringify(result)).not.toContain('must-not-leak');
   });
 
-  it('ignores client-supplied id, userId and timestamps', async () => {
+  it('never exposes the legacy category or nickname columns', async () => {
+    const result = await createAppliance(userId, input);
+
+    expect(result).not.toHaveProperty('category');
+    expect(result).not.toHaveProperty('nickname');
+    expect(JSON.stringify(result)).not.toContain('WASHING_MACHINE');
+    expect(JSON.stringify(result)).not.toContain('Main washer');
+  });
+
+  it('ignores client-supplied id, userId, timestamps and legacy fields', async () => {
     const forged = {
       ...input,
+      category: ApplianceCategory.REFRIGERATOR,
+      nickname: 'Forged nickname',
       id: foreignApplianceId,
       userId: otherUserId,
       createdAt: new Date('1999-01-01T00:00:00.000Z'),
@@ -141,17 +153,16 @@ describe('createAppliance', () => {
 
     const { data } = prisma.appliance.create.mock.calls[0][0];
     expect(data.userId).toBe(userId);
-    expect(Object.keys(data).sort()).toEqual(['brand', 'category', 'modelNumber', 'nickname', 'userId']);
+    expect(Object.keys(data).sort()).toEqual(['brand', 'modelNumber', 'userId']);
   });
 
-  it('normalizes omitted nullable fields to null', async () => {
-    await createAppliance(userId, { category: ApplianceCategory.REFRIGERATOR, brand: 'LG' });
+  it('normalizes an omitted modelNumber to null', async () => {
+    await createAppliance(userId, { brand: 'LG' });
 
-    expect(prisma.appliance.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ modelNumber: null, nickname: null }),
-      }),
-    );
+    expect(prisma.appliance.create).toHaveBeenCalledWith({
+      data: { userId, brand: 'LG', modelNumber: null },
+      select: applianceDtoSelect,
+    });
   });
 
   it('propagates unexpected Prisma failures without wrapping them', async () => {
@@ -183,6 +194,9 @@ describe('listAppliances', () => {
       total: 1,
       totalPages: 1,
     });
+    expect(Object.keys(result.items[0]).sort()).toEqual([...DTO_KEYS].sort());
+    expect(result.items[0]).not.toHaveProperty('category');
+    expect(result.items[0]).not.toHaveProperty('nickname');
   });
 
   it('returns an empty page without errors', async () => {
@@ -221,7 +235,10 @@ describe('getApplianceById', () => {
       select: applianceDtoSelect,
     });
     expect(result).toEqual(toApplianceDto(applianceRecord));
+    expect(Object.keys(result).sort()).toEqual([...DTO_KEYS].sort());
     expect(result).not.toHaveProperty('userId');
+    expect(result).not.toHaveProperty('category');
+    expect(result).not.toHaveProperty('nickname');
   });
 
   it('returns APPLIANCE_NOT_FOUND for a missing appliance', async () => {
@@ -266,27 +283,29 @@ describe('updateAppliance', () => {
       select: applianceDtoSelect,
     });
     expect(result).toEqual(toApplianceDto(applianceRow({ brand: 'Updated Brand' })));
+    expect(Object.keys(result).sort()).toEqual([...DTO_KEYS].sort());
     expect(result).not.toHaveProperty('userId');
+    expect(result).not.toHaveProperty('category');
+    expect(result).not.toHaveProperty('nickname');
   });
 
   it('leaves omitted fields out of the write so they remain unchanged', async () => {
-    await updateAppliance(userId, { id: applianceId }, { nickname: 'Only this changes' });
+    await updateAppliance(userId, { id: applianceId }, { modelNumber: 'Only this changes' });
 
-    expect(prisma.appliance.update.mock.calls[0][0].data).toEqual({ nickname: 'Only this changes' });
+    expect(prisma.appliance.update.mock.calls[0][0].data).toEqual({ modelNumber: 'Only this changes' });
   });
 
   it('sends explicit null so nullable fields can be cleared', async () => {
-    await updateAppliance(userId, { id: applianceId }, { modelNumber: null, nickname: null });
+    await updateAppliance(userId, { id: applianceId }, { modelNumber: null });
 
-    expect(prisma.appliance.update.mock.calls[0][0].data).toEqual({
-      modelNumber: null,
-      nickname: null,
-    });
+    expect(prisma.appliance.update.mock.calls[0][0].data).toEqual({ modelNumber: null });
   });
 
-  it('never lets server-managed fields reach Prisma', async () => {
+  it('never lets server-managed or legacy fields reach Prisma', async () => {
     const forged = {
       brand: 'Updated Brand',
+      category: ApplianceCategory.REFRIGERATOR,
+      nickname: 'Forged nickname',
       id: foreignApplianceId,
       userId: otherUserId,
       createdAt: new Date('1999-01-01T00:00:00.000Z'),

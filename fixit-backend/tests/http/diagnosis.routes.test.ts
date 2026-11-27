@@ -37,15 +37,50 @@ describe('diagnosis routes — authentication before validation', () => {
 });
 
 describe('diagnosis route validation', () => {
-  it('rejects a missing applianceId and missing clues', async () => {
+  it('rejects a session with no identification path and no symptom', async () => {
     const response = await authorized('post', '/diagnosis').send({});
 
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe('VALIDATION_ERROR');
   });
 
-  it('rejects a session with neither symptom nor errorCode', async () => {
+  it('rejects a saved appliance path without the required symptom', async () => {
     const response = await authorized('post', '/diagnosis').send({ applianceId });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('does not accept an errorCode alone in place of the required symptom', async () => {
+    const response = await authorized('post', '/diagnosis').send({ applianceId, errorCode: 'FE' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('rejects both identification paths supplied together', async () => {
+    const response = await authorized('post', '/diagnosis').send({
+      applianceId,
+      brand: 'LG',
+      symptom: 'Not draining',
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('rejects an inline path without the required symptom', async () => {
+    const response = await authorized('post', '/diagnosis').send({ brand: 'LG' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('rejects a blank inline brand', async () => {
+    const response = await authorized('post', '/diagnosis').send({
+      brand: '   ',
+      symptom: 'Not draining',
+    });
 
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe('VALIDATION_ERROR');

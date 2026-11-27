@@ -12,12 +12,33 @@ describe('fixit-test smoke checks (read-only)', () => {
     expect(rows[0]?.ok).toBe(true);
   });
 
-  it('has the five finished migrations', async () => {
+  it('has the six finished migrations', async () => {
     const rows = await prisma.$queryRaw<Array<{ count: number }>>`
       SELECT count(*)::int AS count FROM "_prisma_migrations"
       WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
     `;
-    expect(rows[0]?.count).toBe(5);
+    expect(rows[0]?.count).toBe(6);
+  });
+
+  it('has a nullable legacy Appliance.category column', async () => {
+    const rows = await prisma.$queryRaw<Array<{ name: string; nullable: string }>>`
+      SELECT column_name AS name, is_nullable AS nullable
+      FROM information_schema.columns
+      WHERE table_name = 'Appliance' AND column_name = 'category'
+    `;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.nullable).toBe('YES');
+  });
+
+  it('has a nullable user-authored DiagnosisSession.errorCode column', async () => {
+    const rows = await prisma.$queryRaw<Array<{ name: string; nullable: string; data_type: string }>>`
+      SELECT column_name AS name, is_nullable AS nullable, data_type
+      FROM information_schema.columns
+      WHERE table_name = 'DiagnosisSession' AND column_name = 'errorCode'
+    `;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.nullable).toBe('YES');
+    expect(rows[0]?.data_type).toBe('text');
   });
 
   it('has the expected Verdict enum', async () => {

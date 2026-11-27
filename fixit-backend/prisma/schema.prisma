@@ -46,9 +46,13 @@ model Appliance {
   user              User               @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   userId            String             @db.Uuid
   diagnosisSessions DiagnosisSession[]
-  category          ApplianceCategory
+  // Legacy categories are retained for existing rows; new appliances are not
+  // assigned a category. Category-specific knowledge is only used when a
+  // trusted category is actually present.
+  category          ApplianceCategory?
   brand             String
   modelNumber       String?
+  // Legacy column: no longer written or exposed by the application.
   nickname          String?
   createdAt         DateTime           @default(now())
   updatedAt         DateTime           @updatedAt
@@ -163,12 +167,17 @@ model DiagnosisSession {
   applianceId String?    @db.Uuid
   appliance   Appliance? @relation(fields: [applianceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
-  errorCodeId String?    @db.Uuid
-  errorCode   ErrorCode? @relation(fields: [errorCodeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  errorCodeId     String?    @db.Uuid
+  // Renamed relation field so the user-authored text can use the public name.
+  // The underlying errorCodeId column is unchanged.
+  errorCodeRecord ErrorCode? @relation(fields: [errorCodeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
-  symptom String?
-  status  SessionStatus @default(OPEN)
-  verdict Verdict?
+  symptom   String?
+  // The user-entered manufacturer error code is persisted verbatim (trimmed).
+  // It is distinct from errorCodeId, which is a backend knowledge identifier.
+  errorCode String?
+  status    SessionStatus @default(OPEN)
+  verdict   Verdict?
 
   // Server-managed, single-use challenge for explicit FIXED confirmation.
   // The backend issues, validates, and clears this; it is never client-authored.

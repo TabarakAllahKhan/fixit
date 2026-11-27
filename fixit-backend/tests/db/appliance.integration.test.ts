@@ -21,8 +21,9 @@ import { createTestUser, deleteTestUsers, disconnectTestPrisma, expectNoFields, 
 // empty application tables regardless of file execution order.
 const createdUserIds: string[] = [];
 
-const APPLIANCE_DTO_KEYS = ['id', 'category', 'brand', 'modelNumber', 'nickname', 'createdAt', 'updatedAt'];
-const HIDDEN_APPLIANCE_FIELDS = ['userId'];
+const APPLIANCE_DTO_KEYS = ['id', 'brand', 'modelNumber', 'createdAt', 'updatedAt'];
+// Legacy columns still exist in the database but are not part of the API.
+const HIDDEN_APPLIANCE_FIELDS = ['userId', 'category', 'nickname'];
 
 beforeEach(() => {
   resetRateLimits();
@@ -66,7 +67,7 @@ function bearer(token: string): string {
 }
 
 describe('appliance create and persistence', () => {
-  it('stores the authenticated user id, defaults and a retrievable row', async () => {
+  it('creates without a category and stores the authenticated user id, defaults and a retrievable row', async () => {
     const { user } = await newUser();
     const forgedId = '00000000-0000-7000-8000-0000000000ff';
     const forgedUserId = '00000000-0000-7000-8000-0000000000ee';
@@ -74,8 +75,9 @@ describe('appliance create and persistence', () => {
     // A direct service call proves the server argument wins and client-shaped
     // fields cannot reach Prisma even when the validator is bypassed.
     const input = {
-      category: ApplianceCategory.WASHING_MACHINE,
       brand: 'Bosch',
+      category: ApplianceCategory.WASHING_MACHINE,
+      nickname: 'Forged nickname',
       id: forgedId,
       userId: forgedUserId,
       createdAt: new Date('2001-01-01T00:00:00.000Z'),
@@ -88,14 +90,13 @@ describe('appliance create and persistence', () => {
     expect(created.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(created.brand).toBe('Bosch');
     expect(created.modelNumber).toBeNull();
-    expect(created.nickname).toBeNull();
     expect(created.createdAt).toBeInstanceOf(Date);
     expect(created.updatedAt).toBeInstanceOf(Date);
 
     const stored = await prisma.appliance.findUniqueOrThrow({ where: { id: created.id } });
     expect(stored.id).toBe(created.id);
     expect(stored.userId).toBe(user.id);
-    expect(stored.category).toBe(ApplianceCategory.WASHING_MACHINE);
+    expect(stored.category).toBeNull();
     expect(stored.modelNumber).toBeNull();
     expect(stored.nickname).toBeNull();
     expect(stored.createdAt.toISOString()).toBe(created.createdAt.toISOString());
@@ -105,27 +106,50 @@ describe('appliance create and persistence', () => {
     expect(fetched).toEqual(created);
   });
 
-  it('persists explicit nullable fields for an owned appliance', async () => {
+  it('persists an explicit modelNumber without writing legacy columns', async () => {
     const { user } = await newUser();
     const created = await createAppliance(user.id, {
-      category: ApplianceCategory.REFRIGERATOR,
       brand: 'Samsung',
       modelNumber: 'RB37',
-      nickname: 'Garage fridge',
     });
 
     expectApplianceDtoShape(created);
-    expect(created).toMatchObject({
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'Samsung',
-      modelNumber: 'RB37',
-      nickname: 'Garage fridge',
-    });
+    expect(created).toMatchObject({ brand: 'Samsung', modelNumber: 'RB37' });
 
     const stored = await prisma.appliance.findUniqueOrThrow({ where: { id: created.id } });
     expect(stored.userId).toBe(user.id);
+    expect(stored.category).toBeNull();
     expect(stored.modelNumber).toBe('RB37');
-    expect(stored.nickname).toBe('Garage fridge');
+    expect(stored.nickname).toBeNull();
+  });
+
+  it('keeps legacy category and nickname intact while omitting them from the DTO', async () => {
+    const { user } = await newUser();
+    const legacy = await prisma.appliance.create({
+      data: {
+        userId: user.id,
+        category: ApplianceCategory.WASHING_MACHINE,
+        brand: 'Legacy washer',
+        modelNumber: 'W1',
+        nickname: 'Main washer',
+      },
+    });
+
+    const fetched = await getApplianceById(user.id, { id: legacy.id });
+    expectApplianceDtoShape(fetched);
+    expect(fetched).toMatchObject({ brand: 'Legacy washer', modelNumber: 'W1' });
+    expect(JSON.stringify(fetched)).not.toContain('Main washer');
+
+    const updated = await updateAppliance(user.id, { id: legacy.id }, { brand: 'Renamed washer' });
+    expectApplianceDtoShape(updated);
+    expect(updated.brand).toBe('Renamed washer');
+    expect(updated.modelNumber).toBe('W1');
+
+    const stored = await prisma.appliance.findUniqueOrThrow({ where: { id: legacy.id } });
+    expect(stored.category).toBe(ApplianceCategory.WASHING_MACHINE);
+    expect(stored.nickname).toBe('Main washer');
+    expect(stored.brand).toBe('Renamed washer');
+    expect(stored.modelNumber).toBe('W1');
   });
 });
 
@@ -133,23 +157,14 @@ describe('appliance ownership isolation', () => {
   async function twoOwners() {
     const mine = await newUser();
     const other = await newUser();
-    const mineAppliance = await createAppliance(mine.user.id, {
-      category: ApplianceCategory.WASHING_MACHINE,
-      brand: 'Mine',
-    });
-    const otherAppliance = await createAppliance(other.user.id, {
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'Theirs',
-    });
+    const mineAppliance = await createAppliance(mine.user.id, { brand: 'Mine' });
+    const otherAppliance = await createAppliance(other.user.id, { brand: 'Theirs' });
     return { mine, other, mineAppliance, otherAppliance };
   }
 
   it('lists only the caller’s appliances with owner-scoped counts', async () => {
     const { mine, other, mineAppliance, otherAppliance } = await twoOwners();
-    const secondMine = await createAppliance(mine.user.id, {
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'Mine too',
-    });
+    const secondMine = await createAppliance(mine.user.id, { brand: 'Mine too' });
 
     const mineList = await listAppliances(mine.user.id, { page: 1, limit: 20 });
     const otherList = await listAppliances(other.user.id, { page: 1, limit: 20 });
@@ -192,10 +207,7 @@ describe('appliance list ordering and pagination', () => {
     const created: ApplianceDto[] = [];
 
     for (let index = 0; index < 4; index += 1) {
-      const appliance = await createAppliance(owner.user.id, {
-        category: ApplianceCategory.WASHING_MACHINE,
-        brand: `Brand-${index}`,
-      });
+      const appliance = await createAppliance(owner.user.id, { brand: `Brand-${index}` });
       // Fixed timestamps (including one deliberate tie) remove timing flakiness
       // while still exercising the real ordered query in the service.
       await prisma.appliance.update({
@@ -204,10 +216,7 @@ describe('appliance list ordering and pagination', () => {
       });
       created.push(appliance);
     }
-    await createAppliance(other.user.id, {
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'Not mine',
-    });
+    await createAppliance(other.user.id, { brand: 'Not mine' });
 
     const [first, tiedA, tiedB, newest] = created;
     const tieOrder = [tiedA.id, tiedB.id].sort((left, right) => right.localeCompare(left));
@@ -249,48 +258,36 @@ describe('appliance list ordering and pagination', () => {
 });
 
 describe('appliance update behaviour', () => {
-  it('preserves omitted fields and clears nullable fields on explicit null', async () => {
+  it('preserves omitted fields and clears a nullable field on explicit null', async () => {
     const { user } = await newUser();
     const original = await createAppliance(user.id, {
-      category: ApplianceCategory.WASHING_MACHINE,
       brand: 'LG',
       modelNumber: 'W1',
-      nickname: 'Laundry',
     });
 
     const partial = await updateAppliance(user.id, { id: original.id }, { brand: 'Samsung' });
-    expect(partial).toMatchObject({
-      category: ApplianceCategory.WASHING_MACHINE,
-      brand: 'Samsung',
-      modelNumber: 'W1',
-      nickname: 'Laundry',
-    });
+    expect(partial).toMatchObject({ brand: 'Samsung', modelNumber: 'W1' });
     expect(partial.createdAt.toISOString()).toBe(original.createdAt.toISOString());
     expectApplianceDtoShape(partial);
 
     const afterPartial = await prisma.appliance.findUniqueOrThrow({ where: { id: original.id } });
-    expect(afterPartial.category).toBe(ApplianceCategory.WASHING_MACHINE);
     expect(afterPartial.brand).toBe('Samsung');
     expect(afterPartial.modelNumber).toBe('W1');
-    expect(afterPartial.nickname).toBe('Laundry');
 
-    const cleared = await updateAppliance(user.id, { id: original.id }, { modelNumber: null, nickname: null });
-    expect(cleared).toMatchObject({ brand: 'Samsung', modelNumber: null, nickname: null });
+    const cleared = await updateAppliance(user.id, { id: original.id }, { modelNumber: null });
+    expect(cleared).toMatchObject({ brand: 'Samsung', modelNumber: null });
     expectApplianceDtoShape(cleared);
 
     const afterClear = await prisma.appliance.findUniqueOrThrow({ where: { id: original.id } });
     expect(afterClear.brand).toBe('Samsung');
     expect(afterClear.modelNumber).toBeNull();
-    expect(afterClear.nickname).toBeNull();
   });
 
   it('updates every editable field and advances the schema-managed updatedAt', async () => {
     const { user } = await newUser();
     const created = await createAppliance(user.id, {
-      category: ApplianceCategory.WASHING_MACHINE,
       brand: 'Old brand',
       modelNumber: 'Old-model',
-      nickname: 'Old nickname',
     });
 
     // Move updatedAt to a known old value so the assertion cannot depend on
@@ -301,26 +298,16 @@ describe('appliance update behaviour', () => {
     expect(before.updatedAt.toISOString()).toBe(oldUpdatedAt.toISOString());
 
     const updated = await updateAppliance(user.id, { id: created.id }, {
-      category: ApplianceCategory.REFRIGERATOR,
       brand: 'New brand',
       modelNumber: 'New-model',
-      nickname: 'New nickname',
     });
-    expect(updated).toMatchObject({
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'New brand',
-      modelNumber: 'New-model',
-      nickname: 'New nickname',
-    });
+    expect(updated).toMatchObject({ brand: 'New brand', modelNumber: 'New-model' });
     expectApplianceDtoShape(updated);
 
     const stored = await prisma.appliance.findUniqueOrThrow({ where: { id: created.id } });
-    expect(stored).toMatchObject({
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'New brand',
-      modelNumber: 'New-model',
-      nickname: 'New nickname',
-    });
+    expect(stored).toMatchObject({ brand: 'New brand', modelNumber: 'New-model' });
+    expect(stored.category).toBeNull();
+    expect(stored.nickname).toBeNull();
     expect(stored.createdAt.toISOString()).toBe(before.createdAt.toISOString());
     expect(stored.updatedAt.getTime()).toBeGreaterThan(oldUpdatedAt.getTime());
   });
@@ -331,12 +318,11 @@ describe('appliance delete and diagnosis relation safety', () => {
     const mine = await newUser();
     const other = await newUser();
 
-    const appliance = await createAppliance(mine.user.id, {
-      category: ApplianceCategory.WASHING_MACHINE,
-      brand: 'Drain master',
-    });
+    const appliance = await createAppliance(mine.user.id, { brand: 'Drain master' });
     const session = await createSession(mine.user.id, {
       applianceId: appliance.id,
+      modelNumber: null,
+      errorCode: null,
       symptom: 'Not draining',
     });
     await prisma.message.create({
@@ -348,12 +334,11 @@ describe('appliance delete and diagnosis relation safety', () => {
     });
     expect(messagesBefore).toHaveLength(2);
 
-    const otherAppliance = await createAppliance(other.user.id, {
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'Foreign fridge',
-    });
+    const otherAppliance = await createAppliance(other.user.id, { brand: 'Foreign fridge' });
     const otherSession = await createSession(other.user.id, {
       applianceId: otherAppliance.id,
+      modelNumber: null,
+      errorCode: null,
       symptom: 'Foreign symptom',
     });
     const otherMessagesBefore = await prisma.message.findMany({ where: { sessionId: otherSession.id } });
@@ -409,21 +394,24 @@ describe('appliance HTTP routes with the real database', () => {
       .post('/appliances')
       .set('Authorization', auth)
       .send({
-        category: ApplianceCategory.WASHING_MACHINE,
         brand: '  Bosch  ',
         modelNumber: '',
+        category: ApplianceCategory.WASHING_MACHINE,
         nickname: '  Main washer  ',
         id: forgedId,
         userId: '00000000-0000-7000-8000-0000000000aa',
+        createdAt: '2001-01-01T00:00:00.000Z',
       });
     expect(createResponse.status).toBe(201);
     const created = successData(createResponse.body);
     expectApplianceDtoShape(created);
-    expect(created).toMatchObject({ brand: 'Bosch', modelNumber: null, nickname: 'Main washer' });
+    expect(created).toMatchObject({ brand: 'Bosch', modelNumber: null });
     expect(created.id).not.toBe(forgedId);
 
     const stored = await prisma.appliance.findUniqueOrThrow({ where: { id: created.id as string } });
     expect(stored.userId).toBe(user.id);
+    expect(stored.category).toBeNull();
+    expect(stored.nickname).toBeNull();
 
     const listResponse = await request(app)
       .get('/appliances?page=1&limit=10')
@@ -442,11 +430,22 @@ describe('appliance HTTP routes with the real database', () => {
     const patchResponse = await request(app)
       .patch(`/appliances/${created.id}`)
       .set('Authorization', auth)
-      .send({ nickname: 'Laundry' });
+      .send({
+        brand: '  Samsung  ',
+        category: ApplianceCategory.REFRIGERATOR,
+        nickname: 'Laundry',
+        userId: 'forged-user-id',
+        id: forgedId,
+        createdAt: '2001-01-01T00:00:00.000Z',
+      });
     expect(patchResponse.status).toBe(200);
-    expect(successData(patchResponse.body)).toMatchObject({ brand: 'Bosch', nickname: 'Laundry' });
+    const patchedDto = successData(patchResponse.body);
+    expectApplianceDtoShape(patchedDto);
+    expect(patchedDto).toMatchObject({ brand: 'Samsung', modelNumber: null });
     const patched = await prisma.appliance.findUniqueOrThrow({ where: { id: created.id as string } });
-    expect(patched.nickname).toBe('Laundry');
+    expect(patched.brand).toBe('Samsung');
+    expect(patched.category).toBeNull();
+    expect(patched.nickname).toBeNull();
 
     const deleteResponse = await request(app)
       .delete(`/appliances/${created.id}`)
@@ -468,10 +467,7 @@ describe('appliance HTTP routes with the real database', () => {
   it('returns one identical 404 for foreign-owned get, patch and delete with a real database', async () => {
     const mine = await newUser();
     const other = await newUser();
-    const owned = await createAppliance(other.user.id, {
-      category: ApplianceCategory.REFRIGERATOR,
-      brand: 'Original brand',
-    });
+    const owned = await createAppliance(other.user.id, { brand: 'Original brand' });
     const auth = bearer(mine.accessToken);
     const expectedError = {
       success: false,

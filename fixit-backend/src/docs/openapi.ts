@@ -155,19 +155,19 @@ export const openApiSpec = {
       ApplianceCategory: {
         type: 'string',
         enum: ['WASHING_MACHINE', 'REFRIGERATOR'],
-        description: 'Values accepted by the persisted Appliance model.',
+        description:
+          'Legacy database enum retained for existing records only; categories are not accepted or returned by the appliance API.',
       },
       ApplianceDto: {
         type: 'object',
         additionalProperties: false,
-        description: 'Public appliance fields only; ownership data is never returned.',
-        required: ['id', 'category', 'brand', 'modelNumber', 'nickname', 'createdAt', 'updatedAt'],
+        description:
+          'Public appliance fields only. Ownership data and the legacy category/nickname columns are never returned.',
+        required: ['id', 'brand', 'modelNumber', 'createdAt', 'updatedAt'],
         properties: {
           id: { type: 'string', format: 'uuid' },
-          category: { $ref: '#/components/schemas/ApplianceCategory' },
           brand: { type: 'string', maxLength: 120 },
           modelNumber: { type: 'string', nullable: true, maxLength: 80 },
-          nickname: { type: 'string', nullable: true, maxLength: 100 },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
         },
@@ -188,35 +188,26 @@ export const openApiSpec = {
       CreateApplianceRequest: {
         type: 'object',
         additionalProperties: false,
-        required: ['category', 'brand'],
+        required: ['brand'],
         description:
-          'category and brand are required. modelNumber and nickname are optional; blank strings normalize to null. id, userId and timestamps are not accepted.',
+          'brand is required; modelNumber is optional and blank strings normalize to null. category, nickname, id, userId and timestamps are not accepted.',
         properties: {
-          category: { $ref: '#/components/schemas/ApplianceCategory' },
           brand: { type: 'string', minLength: 1, maxLength: 120, description: 'Trimmed by the server.' },
           modelNumber: { type: 'string', nullable: true, maxLength: 80, description: 'Trimmed by the server.' },
-          nickname: { type: 'string', nullable: true, maxLength: 100, description: 'Trimmed by the server.' },
         },
-        example: {
-          category: 'WASHING_MACHINE',
-          brand: 'LG',
-          modelNumber: 'WW80T3040WW',
-          nickname: 'Main washer',
-        },
+        example: { brand: 'LG', modelNumber: 'WW80T3040WW' },
       },
       UpdateApplianceRequest: {
         type: 'object',
         additionalProperties: false,
         minProperties: 1,
         description:
-          'Provide at least one editable field. Omitted fields are preserved; explicit null clears modelNumber or nickname. id, userId and timestamps are not accepted.',
+          'Provide at least one editable field. Omitted fields are preserved; explicit null clears modelNumber. category and nickname are legacy columns and are not editable. id, userId and timestamps are not accepted.',
         properties: {
-          category: { $ref: '#/components/schemas/ApplianceCategory' },
           brand: { type: 'string', minLength: 1, maxLength: 120, description: 'Trimmed by the server.' },
           modelNumber: { type: 'string', nullable: true, maxLength: 80, description: 'Trimmed by the server.' },
-          nickname: { type: 'string', nullable: true, maxLength: 100, description: 'Trimmed by the server.' },
         },
-        example: { nickname: 'Kitchen fridge' },
+        example: { modelNumber: 'WW80T3040WW' },
       },
       OcrDetectionData: {
         type: 'object',
@@ -442,12 +433,14 @@ export const openApiSpec = {
       SessionDto: {
         type: 'object',
         additionalProperties: false,
-        description: 'Ownership, error-code linkage and confirmation fields are never exposed.',
-        required: ['id', 'applianceId', 'symptom', 'status', 'verdict', 'createdAt', 'updatedAt'],
+        description:
+          'Ownership, internal error-code linkage and confirmation fields are never exposed. errorCode is the user-authored text clue, not an internal database id.',
+        required: ['id', 'applianceId', 'symptom', 'errorCode', 'status', 'verdict', 'createdAt', 'updatedAt'],
         properties: {
           id: { type: 'string', format: 'uuid' },
           applianceId: { type: 'string', format: 'uuid', nullable: true },
           symptom: { type: 'string', nullable: true, maxLength: 2000 },
+          errorCode: { type: 'string', nullable: true, maxLength: 64, description: 'User-entered text clue.' },
           status: { $ref: '#/components/schemas/SessionStatus' },
           verdict: { nullable: true, allOf: [{ $ref: '#/components/schemas/Verdict' }] },
           createdAt: { type: 'string', format: 'date-time' },
@@ -513,15 +506,22 @@ export const openApiSpec = {
         type: 'object',
         additionalProperties: false,
         description:
-          'applianceId must reference an existing appliance owned by the caller. A model number is NOT required: older appliances may have none, and no model number is inferred. Provide at least one starting clue. An errorCode is a text clue only in this phase; no knowledge lookup is performed.',
-        required: ['applianceId'],
-        anyOf: [{ required: ['symptom'] }, { required: ['errorCode'] }],
+          'Provide exactly one identification path: applianceId (an existing appliance owned by the caller) or inline brand with optional modelNumber. Inline identification creates a new owned appliance. symptom is required. errorCode is an optional user-entered text clue, persisted directly; no internal error-code id or client user id is accepted. No knowledge lookup occurs at creation.',
+        required: ['symptom'],
+        oneOf: [{ required: ['applianceId'] }, { required: ['brand'] }],
         properties: {
           applianceId: { type: 'string', format: 'uuid' },
+          brand: { type: 'string', minLength: 1, maxLength: 120, description: 'Trimmed by the server.' },
+          modelNumber: { type: 'string', nullable: true, maxLength: 80, description: 'Trimmed by the server.' },
           symptom: { type: 'string', minLength: 1, maxLength: 2000, description: 'Trimmed by the server.' },
-          errorCode: { type: 'string', minLength: 1, maxLength: 64, description: 'Trimmed by the server.' },
+          errorCode: {
+            type: 'string',
+            nullable: true,
+            maxLength: 64,
+            description: 'Optional user-entered text clue; trimmed by the server and stored directly.',
+          },
         },
-        example: { applianceId: '00000000-0000-7000-8000-000000000001', symptom: 'Not draining' },
+        example: { brand: 'LG', modelNumber: 'WW80T3040WW', symptom: 'Not draining', errorCode: 'FE' },
       },
       SendMessageRequest: {
         type: 'object',
@@ -1393,7 +1393,7 @@ export const openApiSpec = {
         tags: ['Appliance'],
         summary: 'Create a saved appliance',
         description:
-          'Creates an appliance owned by the authenticated user. Only the validated editable fields are written; the owner id comes from the access token. Write requests are rate limited.',
+          'Creates an appliance owned by the authenticated user with a brand and optional model number. Category and nickname are legacy database columns and are not accepted or returned. The owner id comes from the access token. Write requests are rate limited.',
         security: [{ bearerAuth: [] }],
         requestBody: {
           required: true,
@@ -1486,7 +1486,7 @@ export const openApiSpec = {
         tags: ['Diagnosis'],
         summary: 'Create a diagnosis session',
         description:
-          'Verifies that applianceId belongs to the authenticated user, then creates the OPEN session and its initial USER message atomically. The initial message contains the supplied symptom and/or errorCode (newline-separated when both are given). An appliance without a model number is accepted. No AI or knowledge lookup occurs.',
+          'Uses exactly one identification path: an owned applianceId, or inline brand/modelNumber that is saved as a new owned appliance in the same transaction as the OPEN session and its initial USER message. symptom is required. The user-entered errorCode is stored directly on the session; the initial message contains symptom and errorCode newline-separated when both are given. No client user id, internal error-code id, AI or knowledge lookup is involved at creation.',
         security: [{ bearerAuth: [] }],
         requestBody: {
           required: true,

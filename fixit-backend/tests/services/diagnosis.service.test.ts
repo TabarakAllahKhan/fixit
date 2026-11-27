@@ -54,6 +54,7 @@ function openSession(overrides: Record<string, unknown> = {}) {
     id: sessionId,
     status: SessionStatus.OPEN,
     context: null,
+    errorCode: null,
     appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: null },
     ...overrides,
   };
@@ -114,6 +115,7 @@ beforeEach(() => {
     id: sessionId,
     applianceId: '00000000-0000-4000-8000-0000000000c1',
     symptom: 'Not draining',
+    errorCode: null,
     status: SessionStatus.OPEN,
     verdict: null,
     createdAt: new Date(),
@@ -254,7 +256,7 @@ describe('sendMessage trusted identity resolution', () => {
     expect(runDiagnosisTurnMock).toHaveBeenCalledTimes(1);
     return runDiagnosisTurnMock.mock.calls[0]![0] as {
       identity: {
-        category: string;
+        category: string | null;
         brand: string;
         modelNumber: string | null;
         modelSource: string | null;
@@ -387,6 +389,49 @@ describe('sendMessage trusted identity resolution', () => {
       modelSource: null,
       modelConflict: true,
     });
+  });
+
+  it('uses the persisted user-entered error code as the first lookup clue', async () => {
+    prisma.diagnosisSession.findFirst.mockResolvedValue(openSession({ errorCode: 'FE' }));
+    prisma.message.findMany.mockResolvedValue([
+      historyRow(MessageRole.ASSISTANT, 'A previous answer mentioned code ZZ12', '0000000000b5'),
+    ]);
+
+    await sendMessage('user-1', { id: sessionId }, {
+      requestId,
+      content: 'What should I check next?',
+    });
+
+    const codes = searchErrorCodesMock.mock.calls[0]![1] as string[];
+    expect(codes[0]).toBe('FE');
+    expect(searchErrorCodesMock).toHaveBeenCalledWith(
+      { category: 'WASHING_MACHINE', brand: 'TestBrand', modelScope: undefined },
+      codes,
+      false,
+    );
+  });
+
+  it('passes a null appliance category through identity and knowledge lookup', async () => {
+    prisma.diagnosisSession.findFirst.mockResolvedValue(
+      openSession({ appliance: { category: null, brand: 'AnyBrand', modelNumber: 'MODEL-9' } }),
+    );
+
+    await sendMessage('user-1', { id: sessionId }, {
+      requestId,
+      content: 'It is a top-load machine showing FE',
+    });
+
+    expect(lastOrchestratorInput().identity).toMatchObject({
+      category: null,
+      brand: 'AnyBrand',
+      modelNumber: 'MODEL-9',
+      modelScope: null,
+    });
+    expect(searchErrorCodesMock).toHaveBeenCalledWith(
+      { category: null, brand: 'AnyBrand', modelScope: undefined },
+      expect.anything(),
+      false,
+    );
   });
 });
 

@@ -17,8 +17,8 @@ import type {
 // Zod's transform on the optional text fields makes their inferred keys
 // required-but-possibly-undefined. These shapes describe what callers actually
 // supply and stay structurally satisfied by the approved validated inputs.
-type ApplianceInput = Pick<CreateApplianceInput, 'category' | 'brand'> &
-  Partial<Pick<CreateApplianceInput, 'modelNumber' | 'nickname'>>;
+type ApplianceInput = Pick<CreateApplianceInput, 'brand'> &
+  Partial<Pick<CreateApplianceInput, 'modelNumber'>>;
 type AppliancePatch = Partial<ApplianceInput>;
 
 function applianceNotFound(): HttpError {
@@ -38,10 +38,8 @@ export async function createAppliance(userId: string, input: ApplianceInput): Pr
   const created = await prisma.appliance.create({
     data: {
       userId,
-      category: input.category,
       brand: input.brand,
       modelNumber: input.modelNumber ?? null,
-      nickname: input.nickname ?? null,
     },
     select: applianceDtoSelect,
   });
@@ -92,10 +90,8 @@ export async function updateAppliance(
   // is preserved; null is an explicit clear. Unknown/server-managed keys are
   // never copied, so they cannot reach Prisma even if validation is bypassed.
   const data: AppliancePatch = {};
-  if (input.category !== undefined) data.category = input.category;
   if (input.brand !== undefined) data.brand = input.brand;
   if (input.modelNumber !== undefined) data.modelNumber = input.modelNumber;
-  if (input.nickname !== undefined) data.nickname = input.nickname;
 
   try {
     // id is unique and userId is an additional filter on the same conditional

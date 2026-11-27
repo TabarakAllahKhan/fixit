@@ -183,6 +183,7 @@ async function performSendMessage(
       id: true,
       status: true,
       context: true,
+      errorCode: true,
       updatedAt: true,
       appliance: { select: { category: true, brand: true, modelNumber: true } },
     },
@@ -228,7 +229,12 @@ async function performSendMessage(
       brand: identity.brand,
       modelScope: identity.modelScope ?? undefined,
     },
-    extractCandidateCodes([input.content, ...context.diagnosticFacts, ...history.map((m) => m.content)]),
+    // The persisted, user-authored error code is used as-is; it is never
+    // reconstructed from assistant text or from the conversation history.
+    [
+      ...(session.errorCode ? [session.errorCode] : []),
+      ...extractCandidateCodes([input.content, ...context.diagnosticFacts, ...history.map((m) => m.content)]),
+    ],
     env.ALLOW_UNREVIEWED_KNOWLEDGE,
   );
 

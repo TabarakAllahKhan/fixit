@@ -13,28 +13,52 @@ import type { CreateSessionInput, ListSessionsQuery, SessionIdParam } from '../v
 // The first conversation turn is the user's own starting clue(s), in validator
 // order. An error code is a string clue at this stage: no knowledge lookup or
 // errorCodeId linkage exists yet, and no model number is inferred from either.
+// The separately persisted session.errorCode is used directly as a lookup
+// clue on later turns, never reconstructed from this message.
 function initialMessageContent(input: CreateSessionInput): string {
   return [input.symptom, input.errorCode].filter((part): part is string => Boolean(part)).join('\n');
 }
 
 export async function createSession(userId: string, input: CreateSessionInput): Promise<SessionDto> {
-  // Ownership, session creation and the initial message must all succeed or
-  // none of them may be persisted.
+  // Ownership, appliance creation (inline path), session creation and the
+  // initial message must all succeed or none of them may be persisted.
+  // userId always comes from the verified token, never from the request.
   const session = await prisma.$transaction(async (tx) => {
-    const appliance = await tx.appliance.findFirst({
-      where: { id: input.applianceId, userId },
-      select: { id: true },
-    });
+    let applianceId: string;
 
-    if (!appliance) {
-      throw new HttpError(404, 'APPLIANCE_NOT_FOUND', 'Appliance not found');
+    if (input.applianceId) {
+      const appliance = await tx.appliance.findFirst({
+        where: { id: input.applianceId, userId },
+        select: { id: true },
+      });
+
+      if (!appliance) {
+        throw new HttpError(404, 'APPLIANCE_NOT_FOUND', 'Appliance not found');
+      }
+      applianceId = appliance.id;
+    } else {
+      // Validation guarantees a brand on this path. The defensive check keeps
+      // a direct service caller from creating an unidentified appliance.
+      if (!input.brand) {
+        throw new HttpError(400, 'VALIDATION_ERROR', 'A saved appliance or brand is required');
+      }
+      const appliance = await tx.appliance.create({
+        data: {
+          userId,
+          brand: input.brand,
+          modelNumber: input.modelNumber ?? null,
+        },
+        select: { id: true },
+      });
+      applianceId = appliance.id;
     }
 
     const created = await tx.diagnosisSession.create({
       data: {
         userId,
-        applianceId: appliance.id,
-        symptom: input.symptom ?? null,
+        applianceId,
+        symptom: input.symptom,
+        errorCode: input.errorCode ?? null,
       },
       select: sessionDtoSelect,
     });

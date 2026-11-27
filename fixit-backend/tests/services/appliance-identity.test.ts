@@ -49,6 +49,7 @@ describe('trusted appliance identity extraction', () => {
     ]);
     expect(extractUserModelScopes('It is a top-load washer', 'REFRIGERATOR')).toEqual([]);
     expect(extractUserModelScopes('WW80T3040WW', 'WASHING_MACHINE')).toEqual([]);
+    expect(extractUserModelScopes('It is a top-load washer', null)).toEqual([]);
   });
 });
 
@@ -62,6 +63,55 @@ describe('resolveTrustedApplianceIdentity', () => {
 
     expect(identity.category).toBe('REFRIGERATOR');
     expect(identity.brand).toBe('FreshRecord');
+  });
+
+  it('resolves category-less appliances from the trusted row and USER messages only', () => {
+    const identity = resolve({
+      appliance: { category: null, brand: 'AnyBrand', modelNumber: 'REGISTERED-2' },
+      persisted: {
+        version: 1,
+        modelNumber: 'USER-OLD',
+        modelSource: 'USER_MESSAGE',
+        modelScope: 'TOP_LOAD',
+        scopeSource: 'USER_MESSAGE',
+      },
+      userMessages: ['Model USER-OLD'],
+      currentUserContent: 'It is a top-load washer showing FE',
+    });
+
+    expect(identity).toMatchObject({
+      category: null,
+      brand: 'AnyBrand',
+      modelNumber: 'REGISTERED-2',
+      modelSource: 'APPLIANCE',
+      modelScope: null,
+      scopeSource: null,
+      needsModelScope: true,
+    });
+    expect(hasTrustedModel(identity)).toBe(true);
+  });
+
+  it('retains model and scope conflicts for category-less appliances', () => {
+    const identity = resolve({
+      appliance: { category: null, brand: 'AnyBrand', modelNumber: null },
+      persisted: {
+        version: 1,
+        modelNumber: null,
+        modelSource: null,
+        modelScope: null,
+        scopeSource: null,
+        scopeConflict: true,
+      },
+      userMessages: ['Model WW80T3040AA'],
+      currentUserContent: 'No, the model is WW80T3040BB',
+    });
+
+    expect(identity.category).toBeNull();
+    expect(identity.modelNumber).toBeNull();
+    expect(identity.modelConflict).toBe(true);
+    expect(identity.modelScope).toBeNull();
+    expect(identity.scopeConflict).toBe(true);
+    expect(hasTrustedModel(identity)).toBe(false);
   });
 
   it('gives a registered model absolute precedence over user and persisted claims', () => {

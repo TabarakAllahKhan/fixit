@@ -23,14 +23,14 @@ const applianceId = '00000000-0000-7000-8000-000000000001';
 const missingId = '00000000-0000-7000-8000-000000000099';
 const foreignId = '00000000-0000-7000-8000-0000000000aa';
 const authHeader = `Bearer ${signAccessToken(userId)}`;
-const validCreate = { category: 'WASHING_MACHINE', brand: 'LG' };
+const validCreate = { brand: 'LG' };
+
+const DTO_KEYS = ['id', 'brand', 'modelNumber', 'createdAt', 'updatedAt'];
 
 const applianceDto: ApplianceDto = {
   id: applianceId,
-  category: 'WASHING_MACHINE',
   brand: 'LG',
   modelNumber: 'WW80T3040WW',
-  nickname: 'Main washer',
   createdAt: new Date('2026-11-20T00:00:00.000Z'),
   updatedAt: new Date('2026-11-20T00:00:00.000Z'),
 };
@@ -75,6 +75,17 @@ function expectNoServiceCalls(): void {
   for (const mock of serviceMocks()) {
     expect(mock).not.toHaveBeenCalled();
   }
+}
+
+function expectPublicApplianceData(data: Record<string, unknown>): void {
+  expect(Object.keys(data).sort()).toEqual([...DTO_KEYS].sort());
+  for (const field of ['category', 'nickname', 'userId']) {
+    expect(data[field]).toBeUndefined();
+  }
+  expect(data.id).toBe(applianceId);
+  expect(data.createdAt).toBe(applianceDto.createdAt.toISOString());
+  expect(data.updatedAt).toBe(applianceDto.updatedAt.toISOString());
+  expect(JSON.stringify(data)).not.toContain('forged');
 }
 
 beforeEach(() => {
@@ -148,23 +159,24 @@ describe('appliance routes authenticate before validation', () => {
 describe('appliance route behaviour', () => {
   it('creates with validated input and the authenticated user id, returning 201', async () => {
     const response = await authorized('post', '/appliances').send({
-      category: 'WASHING_MACHINE',
       brand: '  LG  ',
       modelNumber: '',
+      category: 'WASHING_MACHINE',
       nickname: '  Main washer  ',
       userId: 'forged-user-id',
       id: 'forged-appliance-id',
+      createdAt: 'forged-timestamp',
+      updatedAt: 'forged-timestamp',
     });
 
     expect(response.status).toBe(201);
     expect(applianceService.createAppliance).toHaveBeenCalledTimes(1);
     expect(applianceService.createAppliance).toHaveBeenCalledWith(userId, {
-      category: 'WASHING_MACHINE',
       brand: 'LG',
       modelNumber: null,
-      nickname: 'Main washer',
     });
     expect(response.body).toEqual({ success: true, data: serializedDto });
+    expectPublicApplianceData(response.body.data as Record<string, unknown>);
   });
 
   it('lists with default pagination', async () => {
@@ -194,18 +206,22 @@ describe('appliance route behaviour', () => {
   it('updates with only validated fields and returns the updated DTO', async () => {
     const response = await authorized('patch', `/appliances/${applianceId}`).send({
       brand: '  Samsung  ',
+      modelNumber: '  ',
+      category: 'REFRIGERATOR',
       nickname: '  Laundry  ',
       userId: 'forged-user-id',
       id: 'forged-appliance-id',
       createdAt: 'forged-timestamp',
+      updatedAt: 'forged-timestamp',
     });
 
     expect(response.status).toBe(200);
     expect(applianceService.updateAppliance).toHaveBeenCalledWith(userId, { id: applianceId }, {
       brand: 'Samsung',
-      nickname: 'Laundry',
+      modelNumber: null,
     });
     expect(response.body).toEqual({ success: true, data: serializedDto });
+    expectPublicApplianceData(response.body.data as Record<string, unknown>);
   });
 
   it('deletes through the service and returns the standard success response', async () => {
@@ -246,8 +262,11 @@ describe('appliance route error mapping', () => {
 describe('appliance route validation', () => {
   it.each([
     { body: {} },
-    { body: { ...validCreate, category: 'DISHWASHER' } },
+    { body: { ...validCreate, brand: '' } },
     { body: { ...validCreate, brand: 'bad\u0000value' } },
+    { body: { ...validCreate, modelNumber: 'm'.repeat(81) } },
+    { body: { category: 'WASHING_MACHINE' } },
+    { body: { nickname: 'Kitchen fridge' } },
   ])('rejects an invalid create body', async ({ body }) => {
     const response = await authorized('post', '/appliances').send(body);
 
@@ -274,7 +293,14 @@ describe('appliance route validation', () => {
     expectNoServiceCalls();
   });
 
-  it.each([{}, { userId: 'forged-user-id' }])('rejects a PATCH without editable fields', async (body) => {
+  it.each([
+    {},
+    { userId: 'forged-user-id' },
+    { id: 'forged-appliance-id' },
+    { category: 'WASHING_MACHINE' },
+    { nickname: 'Kitchen fridge' },
+    { createdAt: 'forged-timestamp' },
+  ])('rejects a PATCH without editable fields', async (body) => {
     const response = await authorized('patch', `/appliances/${applianceId}`).send(body);
 
     expect(response.status).toBe(400);

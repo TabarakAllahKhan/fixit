@@ -1,12 +1,11 @@
 import { z } from 'zod';
 
 /*
-This file is a identity resolver for appliances like washing machine
-and refrigerator.
+Identity resolver for saved appliances of any type.
 
-It uses combination of appliance registered model number
-and user messages to solve the trusted identity of the appliance,ignoring Ai generated model
-number and scope.
+It combines the trusted appliance row with USER-authored messages to resolve a
+model number and (only when a legacy category is known) a category-specific
+configuration scope. AI-generated identity claims are never accepted.
 */
 
 export const trustedApplianceCategorySchema = z.enum(['WASHING_MACHINE', 'REFRIGERATOR']);
@@ -40,7 +39,8 @@ export type PersistedTrustedApplianceIdentity = z.infer<
 
 export type TrustedApplianceIdentity = {
   version: 1;
-  category: ApplianceCategory;
+  // Null for new appliances: no category is inferred from a brand or model.
+  category: ApplianceCategory | null;
   brand: string;
   modelNumber: string | null;
   modelSource: TrustedModelSource | null;
@@ -54,7 +54,7 @@ export type TrustedApplianceIdentity = {
 
 export type ResolveTrustedApplianceIdentityInput = {
   appliance: {
-    category: ApplianceCategory;
+    category: ApplianceCategory | null;
     brand: string;
     modelNumber: string | null;
   };
@@ -154,8 +154,10 @@ const SCOPE_PATTERNS: Record<ApplianceCategory, ReadonlyArray<[TrustedModelScope
 
 // A model number never establishes configuration scope. Only these explicit
 // USER-authored configuration statements may do so, and the patterns are
-// category-specific so a fridge claim cannot set a washer scope.
-export function extractUserModelScopes(text: string, category: ApplianceCategory): TrustedModelScope[] {
+// category-specific so a fridge claim cannot set a washer scope. With no
+// trusted category there is no scope vocabulary, so no scope can be claimed.
+export function extractUserModelScopes(text: string, category: ApplianceCategory | null): TrustedModelScope[] {
+  if (!category) return [];
   return SCOPE_PATTERNS[category]
     .filter(([, pattern]) => pattern.test(text))
     .map(([scope]) => scope);
@@ -227,8 +229,14 @@ function resolveUserScope(
   persisted: PersistedTrustedApplianceIdentity | null,
   userMessages: readonly string[],
   currentUserContent: string,
-  category: ApplianceCategory,
+  category: ApplianceCategory | null,
 ): ScopeResolution {
+  // A category-less appliance has no scope vocabulary. Persisted scope claims
+  // from another category are never promoted, while an unresolved persisted
+  // conflict is retained rather than silently cleared.
+  if (!category) {
+    return { value: null, source: null, conflict: Boolean(persisted?.scopeConflict) };
+  }
   const currentScopes = extractUserModelScopes(currentUserContent, category);
   const persistedConflict = Boolean(persisted?.scopeConflict);
   const currentCorrection = persistedConflict && currentScopes.length > 0;

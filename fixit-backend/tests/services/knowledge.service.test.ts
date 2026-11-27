@@ -132,6 +132,14 @@ describe('searchErrorCodes', () => {
     expect(findManyMock).not.toHaveBeenCalled();
     expect(result.errorCodes).toEqual([]);
   });
+
+  it('returns no category-specific candidates when the category is unknown', async () => {
+    const result = await searchErrorCodes({ ...context, category: null }, ['FE'], true);
+
+    expect(findManyMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ errorCodes: [], repairSteps: [], unverified: false });
+    expect(result.note).toMatch(/no trusted appliance category/i);
+  });
 });
 
 describe('getApprovedRepairSequence', () => {
@@ -208,6 +216,16 @@ describe('getApprovedRepairSequence', () => {
     const result = await getApprovedRepairSequence(errorCodeId, context, false);
 
     expect(result.eligible).toBe(false);
+    expect(result.reason).toMatch(/not applicable/i);
+  });
+
+  it('never returns repair guidance without a trusted category', async () => {
+    findUniqueMock.mockResolvedValue(codeWithSteps());
+
+    const result = await getApprovedRepairSequence(errorCodeId, { ...context, category: null }, true);
+
+    expect(result.eligible).toBe(false);
+    expect(result.steps).toEqual([]);
     expect(result.reason).toMatch(/not applicable/i);
   });
 });

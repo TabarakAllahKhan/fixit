@@ -22,6 +22,7 @@ export const sessionDtoSelect = {
   id: true,
   applianceId: true,
   symptom: true,
+  errorCode: true,
   status: true,
   verdict: true,
   createdAt: true,
@@ -44,6 +45,8 @@ export type SessionDto = {
   id: string;
   applianceId: string | null;
   symptom: string | null;
+  // User-authored text clue, never an internal ErrorCode database identifier.
+  errorCode: string | null;
   status: DiagnosisSession['status'];
   verdict: DiagnosisSession['verdict'];
   createdAt: Date;
@@ -84,6 +87,7 @@ export function toSessionDto(session: SessionRecord): SessionDto {
     id: session.id,
     applianceId: session.applianceId,
     symptom: session.symptom,
+    errorCode: session.errorCode,
     status: session.status,
     verdict: session.verdict,
     createdAt: session.createdAt,

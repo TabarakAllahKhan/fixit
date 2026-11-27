@@ -51,7 +51,7 @@ function declaration(
 export const diagnosisTools: readonly AiFunctionDeclaration[] = [
   declaration(
     'search_error_codes',
-    'Look up approved error-code candidates for the trusted appliance category and brand. Use when an error code is known or suspected.',
+    'Look up approved error-code candidates for the trusted appliance brand and category when one is known. Use when an error code is known or suspected; no category-specific candidates exist without a trusted category.',
     {
       type: 'object',
       properties: {

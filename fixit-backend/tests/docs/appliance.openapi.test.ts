@@ -70,14 +70,23 @@ describe('appliance OpenAPI request schemas', () => {
 
     const create = schema('CreateApplianceRequest');
     expect(create.additionalProperties).toBe(false);
-    expect(create.required).toEqual(['category', 'brand']);
-    expect(Object.keys(create.properties).sort()).toEqual(['brand', 'category', 'modelNumber', 'nickname']);
-    expect(create.properties.category.$ref).toBe('#/components/schemas/ApplianceCategory');
-    expect(schema('ApplianceCategory').enum).toEqual(['WASHING_MACHINE', 'REFRIGERATOR']);
+    expect(create.required).toEqual(['brand']);
+    expect(Object.keys(create.properties).sort()).toEqual(['brand', 'modelNumber']);
+    expect(create.properties.category).toBeUndefined();
+    expect(create.properties.nickname).toBeUndefined();
+    expect(create.description).toMatch(/category, nickname, id, userId and timestamps are not accepted/i);
     expect(create.properties.brand.minLength).toBe(1);
     expect(create.properties.brand.maxLength).toBe(120);
     expect(create.properties.modelNumber).toMatchObject({ type: 'string', nullable: true, maxLength: 80 });
-    expect(create.properties.nickname).toMatchObject({ type: 'string', nullable: true, maxLength: 100 });
+  });
+
+  it('keeps ApplianceCategory only as a documented legacy enum', () => {
+    const legacy = schema('ApplianceCategory');
+    expect(legacy.enum).toEqual(['WASHING_MACHINE', 'REFRIGERATOR']);
+    expect(legacy.description).toMatch(/legacy/i);
+    for (const name of ['ApplianceDto', 'CreateApplianceRequest', 'UpdateApplianceRequest']) {
+      expect(JSON.stringify(schema(name))).not.toContain('#/components/schemas/ApplianceCategory');
+    }
   });
 
   it('documents the partial update body and rejects empty patches', () => {
@@ -90,7 +99,9 @@ describe('appliance OpenAPI request schemas', () => {
     expect(update.minProperties).toBe(1);
     expect(update.required).toBeUndefined();
     expect(Object.keys(update.properties).sort()).toEqual(Object.keys(schema('CreateApplianceRequest').properties).sort());
+    expect(Object.keys(update.properties).sort()).toEqual(['brand', 'modelNumber']);
     expect(update.description).toMatch(/at least one editable field/i);
+    expect(update.description).toMatch(/category and nickname are legacy columns/i);
   });
 
   it('documents pagination defaults and the UUID path parameter', () => {
@@ -136,18 +147,20 @@ describe('appliance OpenAPI response schemas', () => {
   const mapped = toApplianceDto(rawAppliance);
 
   it('documents exactly the fields the DTO mapper returns', () => {
+    const expectedKeys = ['id', 'brand', 'modelNumber', 'createdAt', 'updatedAt'];
     const dto = schema('ApplianceDto');
-    expect(Object.keys(dto.properties).sort()).toEqual(Object.keys(mapped).sort());
-    expect(Object.keys(applianceDtoSelect).sort()).toEqual(Object.keys(mapped).sort());
-    expect(dto.required.sort()).toEqual(Object.keys(mapped).sort());
+    expect(Object.keys(dto.properties)).toEqual(expectedKeys);
+    expect(Object.keys(mapped)).toEqual(expectedKeys);
+    expect(Object.keys(applianceDtoSelect)).toEqual(expectedKeys);
+    expect(dto.required.sort()).toEqual([...expectedKeys].sort());
     expect(dto.additionalProperties).toBe(false);
-    expect(dto.properties.category.$ref).toBe('#/components/schemas/ApplianceCategory');
-    expect(schema('ApplianceCategory').enum).toEqual(['WASHING_MACHINE', 'REFRIGERATOR']);
+    expect(dto.description).toMatch(/legacy category\/nickname columns are never returned/i);
     expect(dto.properties.modelNumber.nullable).toBe(true);
-    expect(dto.properties.nickname.nullable).toBe(true);
     expect(dto.properties.createdAt.format).toBe('date-time');
     expect(dto.properties.updatedAt.format).toBe('date-time');
     expect(JSON.stringify(mapped)).not.toContain('userId');
+    expect(JSON.stringify(mapped)).not.toContain('WASHING_MACHINE');
+    expect(JSON.stringify(mapped)).not.toContain('Main washer');
   });
 
   it('documents the shared pagination envelope with appliance items', () => {

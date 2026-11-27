@@ -92,22 +92,47 @@ describe('OpenAPI document shape', () => {
 });
 
 describe('request schemas match the validators', () => {
-  it('documents the create-session body and its model-number-free contract', () => {
+  it('documents the create-session body with its identification paths and required symptom', () => {
     const body = operation('/diagnosis', 'post').requestBody;
     expect(body.required).toBe(true);
     expect(body.content['application/json'].schema.$ref).toBe('#/components/schemas/CreateDiagnosisRequest');
 
     const create = schema('CreateDiagnosisRequest');
-    expect(create.required).toEqual(['applianceId']);
+    expect(create.required).toEqual(['symptom']);
+    expect(create.oneOf).toEqual([{ required: ['applianceId'] }, { required: ['brand'] }]);
     expect(create.properties.applianceId.format).toBe('uuid');
+    expect(create.properties.brand.maxLength).toBe(120);
+    expect(create.properties.modelNumber.maxLength).toBe(80);
     expect(create.properties.symptom.maxLength).toBe(2000);
     expect(create.properties.errorCode.maxLength).toBe(64);
-    expect(create.anyOf).toEqual([{ required: ['symptom'] }, { required: ['errorCode'] }]);
-    expect(create.description).toMatch(/model number is NOT required/i);
+    expect(create.description).toMatch(/exactly one identification path/i);
+    expect(create.description).toMatch(/symptom is required/i);
+    expect(create.description).toMatch(/no internal error-code id or client user id is accepted/i);
 
     expect(createSessionSchema.safeParse({ applianceId: 'not-a-uuid', symptom: 'x' }).success).toBe(false);
     expect(createSessionSchema.safeParse({ applianceId: crypto.randomUUID() }).success).toBe(false);
-    expect(createSessionSchema.safeParse({ applianceId: crypto.randomUUID(), errorCode: 'FE' }).success).toBe(true);
+    expect(
+      createSessionSchema.safeParse({ applianceId: crypto.randomUUID(), errorCode: 'FE' }).success,
+    ).toBe(false);
+    expect(createSessionSchema.safeParse({ brand: 'LG', symptom: 'Not draining' }).success).toBe(true);
+    expect(
+      createSessionSchema.safeParse({
+        applianceId: crypto.randomUUID(),
+        brand: 'LG',
+        symptom: 'Not draining',
+      }).success,
+    ).toBe(false);
+    expect(
+      createSessionSchema.safeParse({
+        brand: 'LG',
+        symptom: 'Not draining',
+        errorCodeId: '00000000-0000-7000-8000-0000000000ee',
+        userId: '00000000-0000-7000-8000-0000000000ff',
+      }),
+    ).toEqual({
+      success: true,
+      data: { brand: 'LG', symptom: 'Not draining' },
+    });
   });
 
   it('documents the idempotent message body', () => {
@@ -168,6 +193,7 @@ describe('response schemas match the DTO mappers', () => {
     id: '00000000-0000-7000-8000-000000000002',
     applianceId: '00000000-0000-7000-8000-000000000001',
     symptom: 'Not draining',
+    errorCode: 'FE',
     status: 'OPEN' as const,
     verdict: null,
     createdAt: new Date('2026-11-17T00:00:00.000Z'),

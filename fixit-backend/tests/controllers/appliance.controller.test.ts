@@ -33,13 +33,13 @@ const params: ApplianceIdParam = { id: applianceId };
 
 const applianceDto: ApplianceDto = {
   id: applianceId,
-  category: 'WASHING_MACHINE',
   brand: 'LG',
   modelNumber: 'WW80T3040WW',
-  nickname: 'Main washer',
   createdAt: new Date('2026-11-20T00:00:00.000Z'),
   updatedAt: new Date('2026-11-20T00:00:00.000Z'),
 };
+
+const DTO_KEYS = ['id', 'brand', 'modelNumber', 'createdAt', 'updatedAt'];
 
 const pageDto: PaginatedApplianceDto = {
   items: [applianceDto],
@@ -71,12 +71,7 @@ beforeEach(() => {
 
 describe('appliance controller delegation', () => {
   it('creates with the token user id and only validated input', async () => {
-    const body = {
-      category: 'WASHING_MACHINE',
-      brand: 'LG',
-      modelNumber: null,
-      nickname: 'Main washer',
-    } as CreateApplianceInput;
+    const body = { brand: 'LG', modelNumber: null } as CreateApplianceInput;
     vi.mocked(applianceService.createAppliance).mockResolvedValue(applianceDto);
     const { res, status, json } = responseMock();
     const next = vi.fn();
@@ -86,6 +81,10 @@ describe('appliance controller delegation', () => {
     expect(applianceService.createAppliance).toHaveBeenCalledWith(userId, body);
     expect(status).toHaveBeenCalledWith(201);
     expect(json).toHaveBeenCalledWith({ success: true, data: applianceDto });
+    const data = json.mock.calls[0][0].data as Record<string, unknown>;
+    expect(Object.keys(data).sort()).toEqual([...DTO_KEYS].sort());
+    expect(data).not.toHaveProperty('category');
+    expect(data).not.toHaveProperty('nickname');
     expect(next).not.toHaveBeenCalled();
   });
 

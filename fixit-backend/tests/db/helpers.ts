@@ -26,12 +26,14 @@ export async function createTestUser(): Promise<{ user: TestUser; accessToken: s
 
 export async function createTestAppliance(
   userId: string,
-  options: { modelNumber?: string | null } = {},
+  options: { modelNumber?: string | null; category?: ApplianceCategory | null } = {},
 ) {
   return prisma.appliance.create({
     data: {
       userId,
-      category: ApplianceCategory.WASHING_MACHINE,
+      // Legacy fixture category so knowledge-backed tests can still exercise
+      // category-specific lookups. Pass null to model a new category-less row.
+      category: options.category === undefined ? ApplianceCategory.WASHING_MACHINE : options.category,
       brand: 'TestBrand',
       // Explicit null is a valid "unknown model" fixture; undefined leaves the
       // column at its schema default (also null).
