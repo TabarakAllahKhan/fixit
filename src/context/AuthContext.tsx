@@ -4,10 +4,12 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type PropsWithChildren,
 } from 'react';
 import { ApiError } from '@/lib/api';
+import { setAuthSessionHooks } from '@/lib/authenticated-api';
 import {
   getCurrentUser,
   login as loginApi,
@@ -53,6 +55,12 @@ export function AuthProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [user, setUser] = useState<PublicUser | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(null);
+  const statusRef = useRef<AuthStatus>('loading');
+
+  const updateStatus = useCallback((next: AuthStatus) => {
+    statusRef.current = next;
+    setStatus(next);
+  }, []);
 
   const applySignedOut = useCallback(async () => {
     try {
@@ -62,14 +70,39 @@ export function AuthProvider({ children }: PropsWithChildren) {
     }
     setUser(null);
     setAccessToken(null);
-    setStatus('unauthenticated');
-  }, []);
+    updateStatus('unauthenticated');
+  }, [updateStatus]);
 
   const applyStoredSession = useCallback(async (session: StoredSession) => {
     await saveSession(session);
     setUser(session.user);
     setAccessToken(session.tokens.accessToken);
   }, []);
+
+  const applyRefreshedSession = useCallback(async (session: StoredSession) => {
+    // A late refresh must not resurrect a session the user already signed out of.
+    if (statusRef.current !== 'authenticated') return;
+    await saveSession(session);
+    setUser(session.user);
+    setAccessToken(session.tokens.accessToken);
+  }, []);
+
+  const handleSessionInvalidated = useCallback(async () => {
+    if (statusRef.current !== 'authenticated') return;
+    await applySignedOut();
+  }, [applySignedOut]);
+
+  useEffect(() => {
+    setAuthSessionHooks({
+      onTokensRefreshed: (session) => {
+        void applyRefreshedSession(session);
+      },
+      onSessionInvalidated: () => {
+        void handleSessionInvalidated();
+      },
+    });
+    return () => setAuthSessionHooks(null);
+  }, [applyRefreshedSession, handleSessionInvalidated]);
 
   useEffect(() => {
     let mounted = true;
@@ -110,7 +143,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
         if (!mounted) return;
         setUser(active.user);
         setAccessToken(active.tokens.accessToken);
-        setStatus('authenticated');
+        updateStatus('authenticated');
       } catch (error) {
         if (!mounted) return;
         if (isAuthRejection(error)) {
@@ -122,7 +155,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
         if (cached) {
           setUser(cached.user);
           setAccessToken(cached.tokens.accessToken);
-          setStatus('authenticated');
+          updateStatus('authenticated');
         } else {
           await applySignedOut();
         }
@@ -133,16 +166,16 @@ export function AuthProvider({ children }: PropsWithChildren) {
     return () => {
       mounted = false;
     };
-  }, [applySignedOut]);
+  }, [applySignedOut, updateStatus]);
 
   const signIn = useCallback(
     async (input: LoginRequest) => {
       const result = await loginApi(input);
       await applyStoredSession(createStoredSession(result.user, result.tokens));
-      setStatus('authenticated');
+      updateStatus('authenticated');
       return result;
     },
-    [applyStoredSession],
+    [applyStoredSession, updateStatus],
   );
 
   const signUp = useCallback(
@@ -157,8 +190,8 @@ export function AuthProvider({ children }: PropsWithChildren) {
   );
 
   const finishSignUp = useCallback(() => {
-    setStatus('authenticated');
-  }, []);
+    updateStatus('authenticated');
+  }, [updateStatus]);
 
   const signOut = useCallback(async () => {
     const stored = await getSession();
