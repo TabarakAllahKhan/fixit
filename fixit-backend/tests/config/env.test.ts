@@ -49,6 +49,13 @@ describe('environment schema', () => {
     expect(result.data.FIX_CONFIRMATION_TTL_SECONDS).toBe(600);
     expect(result.data.PARTS_PROVIDER).toBe('none');
     expect(result.data.PARTS_MAX_RESULTS).toBe(5);
+    expect(result.data.RESEARCH_PROVIDER).toBe('none');
+    expect(result.data.RESEARCH_MANUFACTURER_DOMAINS).toContain('lg.com');
+    expect(result.data.RESEARCH_TECHNICAL_DOMAINS).toContain('partselect.com');
+    expect(result.data.RESEARCH_MAX_RESULTS).toBe(5);
+    expect(result.data.RESEARCH_MAX_TITLE_LENGTH).toBe(160);
+    expect(result.data.RESEARCH_MAX_SNIPPET_LENGTH).toBe(360);
+    expect(result.data.RESEARCH_MAX_SERIALIZED_BYTES).toBe(20_000);
     expect(result.data.GROQ_API_KEY).toBeUndefined();
     expect(result.data.ALLOW_UNREVIEWED_KNOWLEDGE).toBe(false);
   });
@@ -146,6 +153,42 @@ describe('environment schema', () => {
     );
   });
 
+  it('validates bounded web-research configuration', () => {
+    const valid = parseEnv({
+      ...baseEnv,
+      RESEARCH_PROVIDER: 'groq_browser',
+      RESEARCH_MANUFACTURER_DOMAINS: ' LG.COM , lg.com ',
+      RESEARCH_TECHNICAL_DOMAINS: 'repairclinic.com',
+      RESEARCH_MAX_RESULTS: '10',
+      RESEARCH_MAX_TITLE_LENGTH: '200',
+      RESEARCH_MAX_SNIPPET_LENGTH: '500',
+      RESEARCH_MAX_SERIALIZED_BYTES: '8000',
+    });
+    expect(valid.success).toBe(true);
+    if (valid.success) {
+      expect(valid.data.RESEARCH_PROVIDER).toBe('groq_browser');
+      expect(valid.data.RESEARCH_MAX_RESULTS).toBe(10);
+      expect(valid.data.RESEARCH_MAX_TITLE_LENGTH).toBe(200);
+      expect(valid.data.RESEARCH_MAX_SNIPPET_LENGTH).toBe(500);
+      expect(valid.data.RESEARCH_MAX_SERIALIZED_BYTES).toBe(8_000);
+    }
+
+    expect(failingPaths({ ...baseEnv, RESEARCH_PROVIDER: 'google' })).toContain('RESEARCH_PROVIDER');
+    expect(failingPaths({ ...baseEnv, RESEARCH_MANUFACTURER_DOMAINS: '   ' })).toContain(
+      'RESEARCH_MANUFACTURER_DOMAINS',
+    );
+    expect(failingPaths({ ...baseEnv, RESEARCH_TECHNICAL_DOMAINS: ' ' })).toContain(
+      'RESEARCH_TECHNICAL_DOMAINS',
+    );
+    expect(failingPaths({ ...baseEnv, RESEARCH_MAX_RESULTS: '0' })).toContain('RESEARCH_MAX_RESULTS');
+    expect(failingPaths({ ...baseEnv, RESEARCH_MAX_TITLE_LENGTH: '10' })).toContain(
+      'RESEARCH_MAX_TITLE_LENGTH',
+    );
+    expect(failingPaths({ ...baseEnv, RESEARCH_MAX_SERIALIZED_BYTES: '100' })).toContain(
+      'RESEARCH_MAX_SERIALIZED_BYTES',
+    );
+  });
+
   it('requires GOOGLE_API_KEY in production', () => {
     expect(failingPaths({ ...baseEnv, NODE_ENV: 'production' })).toContain('GOOGLE_API_KEY');
   });
@@ -202,6 +245,18 @@ describe('environment schema', () => {
         PARTS_PROVIDER: 'groq_browser',
       }).success,
     ).toBe(true);
+  });
+
+  it('requires a Groq credential in production when web research is enabled', () => {
+    const productionResearch = {
+      ...baseEnv,
+      NODE_ENV: 'production' as const,
+      GOOGLE_API_KEY: 'production-key',
+      RESEARCH_PROVIDER: 'groq_browser' as const,
+    };
+
+    expect(failingPaths(productionResearch)).toContain('GROQ_API_KEY');
+    expect(parseEnv({ ...productionResearch, GROQ_API_KEY: 'research-key' }).success).toBe(true);
   });
 
   it('rejects disabled rate limiting in production', () => {

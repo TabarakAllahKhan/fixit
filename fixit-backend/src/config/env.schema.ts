@@ -85,6 +85,31 @@ export const envSchema = z
         'samsung.com,lg.com,whirlpool.com,bosch-home.com,bosch.com,haier.com,partselect.com,repairclinic.com,appliancepartspros.com,searspartsdirect.com',
       ),
     PARTS_MAX_RESULTS: z.coerce.number().int().min(1).max(10).default(5),
+
+    // Backend web research is opt-in and disabled by default. Groq browser
+    // search is the only supported provider; it reuses the validated Groq
+    // credentials and model above. Domain hints are best-effort only: every
+    // result is validated against these allowlists in the research service.
+    RESEARCH_PROVIDER: z.enum(['none', 'groq_browser']).default('none'),
+    RESEARCH_MANUFACTURER_DOMAINS: z
+      .string()
+      .trim()
+      .min(1)
+      .max(2_000)
+      .default(
+        'samsung.com,lg.com,whirlpool.com,bosch-home.com,bosch.com,haier.com,geappliances.com,whirlpool.ca',
+      ),
+    RESEARCH_TECHNICAL_DOMAINS: z
+      .string()
+      .trim()
+      .min(1)
+      .max(2_000)
+      .default('partselect.com,repairclinic.com,appliancepartspros.com,searspartsdirect.com'),
+    RESEARCH_MAX_RESULTS: z.coerce.number().int().min(1).max(10).default(5),
+    RESEARCH_MAX_TITLE_LENGTH: z.coerce.number().int().min(20).max(500).default(160),
+    RESEARCH_MAX_SNIPPET_LENGTH: z.coerce.number().int().min(40).max(2_000).default(360),
+    RESEARCH_MAX_SERIALIZED_BYTES: z.coerce.number().int().min(1_000).max(100_000).default(20_000),
+
     // Development-only access to UNREVIEWED knowledge. Rejected in production.
     ALLOW_UNREVIEWED_KNOWLEDGE: booleanFromEnv,
   })
@@ -107,6 +132,14 @@ export const envSchema = z
         code: 'custom',
         path: ['GROQ_API_KEY'],
         message: 'GROQ_API_KEY is required in production when PARTS_PROVIDER=groq_browser',
+      });
+    }
+
+    if (value.RESEARCH_PROVIDER === 'groq_browser' && !value.GROQ_API_KEY) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['GROQ_API_KEY'],
+        message: 'GROQ_API_KEY is required in production when RESEARCH_PROVIDER=groq_browser',
       });
     }
 

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { env } from '../../src/config/env.js';
 import { HttpError } from '../../src/utils/httpError.js';
+import { liveGroqBrowserResponse } from '../fixtures/groqBrowserLiveResponse.js';
 
 const { createChatCompletionMock } = vi.hoisted(() => ({
   createChatCompletionMock: vi.fn(),
@@ -312,6 +313,70 @@ describe('searchReplacementParts', () => {
     expect(result.candidates).toHaveLength(1);
     expect(result.candidates[0]?.url).toBe('https://lg.com/pump');
     expect(result.candidates[0]?.compatibility).toBe('POSSIBLE_MATCH');
+  });
+
+  it('extracts candidates from the observed live search_results fixture', async () => {
+    env.PARTS_PROVIDER = 'groq_browser';
+    createChatCompletionMock.mockResolvedValue(liveGroqBrowserResponse);
+
+    const result = await searchReplacementParts(query);
+
+    expect(result.candidates.length).toBeGreaterThan(0);
+    expect(result.candidates[0]?.url).toBe('https://www.lg.com/us/support/washers/wt-h7550');
+    expect(result.candidates.every((candidate) => isValidPartsUrl(candidate.url))).toBe(true);
+  });
+
+  it('uses opened-page content from the live response but never attaches tool.output to another URL', async () => {
+    env.PARTS_PROVIDER = 'groq_browser';
+    createChatCompletionMock.mockResolvedValue({
+      choices: [
+        {
+          message: {
+            executed_tools: [
+              {
+                name: 'browser.search',
+                type: 'browser_search',
+                search_results: {
+                  results: [
+                    {
+                      title: 'Generic support page',
+                      url: 'https://www.lg.com/support/generic',
+                      content: '',
+                      score: 0.8,
+                    },
+                  ],
+                },
+                output: `Fits ${query.modelNumber} drain pump, part ${query.partNumber}`,
+              },
+              {
+                name: 'browser.open',
+                type: 'browser.open',
+                search_results: {
+                  results: [
+                    {
+                      title: 'Drain pump listing',
+                      url: 'https://www.lg.com/parts/drain-pump',
+                      content: `Fits ${query.modelNumber} drain pump, part ${query.partNumber}.`,
+                      score: 0.99,
+                    },
+                  ],
+                },
+                output: `Fits ${query.modelNumber} drain pump, part ${query.partNumber}`,
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    const result = await searchReplacementParts(query);
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]).toMatchObject({
+      url: 'https://www.lg.com/parts/drain-pump',
+      compatibility: 'VERIFIED',
+      partNumber: query.partNumber,
+    });
   });
 
   it('propagates provider failures for the orchestrator to degrade safely', async () => {

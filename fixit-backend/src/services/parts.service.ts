@@ -1,5 +1,3 @@
-import { isIP } from 'node:net';
-import { z } from 'zod';
 import { env } from '../config/env.js';
 import { createChatCompletion } from './groq.service.js';
 import {
@@ -7,6 +5,15 @@ import {
   type PartCandidateDto,
   type PartsDto,
 } from '../validators/ai.validator.js';
+import { extractBrowserResults } from '../utils/groqBrowserResponse.js';
+import { containsExactToken } from '../utils/textMatching.js';
+import {
+  canonicalUrlKey,
+  isValidAllowedHttpsUrl,
+  matchAllowedDomain,
+  parseAllowedDomains,
+  parseAllowedHttpsUrl,
+} from '../utils/trustedSource.js';
 
 export type PartsQuery = {
   brand: string;
@@ -18,48 +25,12 @@ export type PartsQuery = {
   partNumber?: string;
 };
 
-const rawBrowserResultSchema = z.object({
-  title: z.string().trim().min(1).max(500),
-  url: z.string().trim().min(1).max(2048),
-  content: z.string().max(20_000).optional(),
-});
-
 function domainList(): string[] {
-  return env.PARTS_ALLOWED_DOMAINS.split(',')
-    .map((domain) => domain.trim().toLowerCase().replace(/^\.+|\.+$/g, ''))
-    .filter((domain) => /^[a-z0-9.-]{1,253}$/.test(domain) && !domain.includes('..'));
-}
-
-function isAllowedHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  return domainList().some((domain) => host === domain || host.endsWith(`.${domain}`));
+  return parseAllowedDomains(env.PARTS_ALLOWED_DOMAINS);
 }
 
 export function isValidPartsUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== 'https:') return false;
-    if (url.username || url.password) return false;
-    if (isIP(url.hostname.replace(/^\[|\]$/g, ''))) return false;
-    return isAllowedHost(url.hostname);
-  } catch {
-    return false;
-  }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Exact, delimiter-bounded matching prevents a shorter query model from being
-// “confirmed” by a longer, merely similar model number. Match the literal text
-// instead of a stripped string: stripping punctuation removes the boundaries
-// that make this check safe.
-function containsExactToken(text: string, value: string): boolean {
-  const needle = value.trim();
-  if (!needle) return false;
-  const pattern = new RegExp(`(^|[^A-Z0-9])${escapeRegExp(needle)}(?=$|[^A-Z0-9])`, 'i');
-  return pattern.test(text);
+  return isValidAllowedHttpsUrl(value, domainList());
 }
 
 function componentTokens(component: string): string[] {
@@ -133,25 +104,6 @@ function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 3)}...`;
 }
 
-function extractBrowserResults(completion: {
-  choices?: Array<{ message?: { executed_tools?: unknown } }>;
-}): z.infer<typeof rawBrowserResultSchema>[] {
-  const tools = completion.choices?.[0]?.message?.executed_tools;
-  if (!Array.isArray(tools)) return [];
-
-  const results: z.infer<typeof rawBrowserResultSchema>[] = [];
-  for (const tool of tools) {
-    if (!tool || typeof tool !== 'object') continue;
-    const browserResults = (tool as { browser_results?: unknown }).browser_results;
-    if (!Array.isArray(browserResults)) continue;
-    for (const candidate of browserResults) {
-      const parsed = rawBrowserResultSchema.safeParse(candidate);
-      if (parsed.success) results.push(parsed.data);
-    }
-  }
-  return results;
-}
-
 export async function searchReplacementParts(query: PartsQuery): Promise<PartsDto> {
   if (env.PARTS_PROVIDER !== 'groq_browser') {
     return { note: 'Parts search is disabled by configuration.', candidates: [] };
@@ -173,6 +125,7 @@ export async function searchReplacementParts(query: PartsQuery): Promise<PartsDt
     };
   }
 
+  const domains = domainList();
   const completion = await createChatCompletion({
     model: env.GROQ_MODEL,
     messages: [
@@ -188,15 +141,19 @@ export async function searchReplacementParts(query: PartsQuery): Promise<PartsDt
     temperature: 0.2,
     max_completion_tokens: 900,
     reasoning_effort: 'low',
-    search_settings: { include_domains: domainList() },
+    search_settings: { include_domains: domains },
   });
 
   const candidates: PartCandidateDto[] = [];
   const seen = new Set<string>();
   for (const raw of extractBrowserResults(completion)) {
     if (candidates.length >= env.PARTS_MAX_RESULTS) break;
-    if (!isValidPartsUrl(raw.url) || seen.has(raw.url)) continue;
-    seen.add(raw.url);
+    // The URL hint is best-effort; backend allowlist validation is authoritative.
+    const validated = parseAllowedHttpsUrl(raw.url, domains);
+    if (!validated) continue;
+    const key = canonicalUrlKey(validated.url);
+    if (seen.has(key)) continue;
+    seen.add(key);
 
     const title = truncate(raw.title, 200);
     const content = raw.content ?? '';
@@ -216,14 +173,14 @@ export async function searchReplacementParts(query: PartsQuery): Promise<PartsDt
       classifyCompatibility({
         query,
         sourceText,
-        trustedSource: isAllowedHost(new URL(raw.url).hostname),
+        trustedSource: matchAllowedDomain(validated.hostname, domains) !== null,
       }),
     );
 
     candidates.push({
       partName: title,
-      sourceName: sourceNameFromUrl(raw.url),
-      url: raw.url,
+      sourceName: sourceNameFromUrl(validated.url),
+      url: validated.url,
       compatibility,
       reason: compatibilityReason(compatibility),
       ...(exactPartNumber && query.partNumber ? { partNumber: query.partNumber } : {}),
