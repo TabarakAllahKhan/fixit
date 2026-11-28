@@ -142,7 +142,7 @@ export async function searchReplacementParts(query: PartsQuery): Promise<PartsDt
     max_completion_tokens: 900,
     reasoning_effort: 'low',
     search_settings: { include_domains: domains },
-  });
+  }, undefined, { timeoutMs: env.PARTS_TIMEOUT_MS });
 
   const candidates: PartCandidateDto[] = [];
   const seen = new Set<string>();

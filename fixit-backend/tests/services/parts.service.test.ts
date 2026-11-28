@@ -205,6 +205,9 @@ describe('searchReplacementParts', () => {
           expect.objectContaining({ role: 'user', content: buildPartsQuery(query) }),
         ]),
       }),
+      undefined,
+      // Parts lookup uses its own bounded, configurable timeout.
+      { timeoutMs: env.PARTS_TIMEOUT_MS },
     );
     expect(result.modelNumberUsed).toBe('WT-H7550');
     expect(result.candidates).toHaveLength(2);

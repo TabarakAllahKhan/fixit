@@ -26,10 +26,19 @@ import type {
   SendMessageInput,
   SessionIdParam,
 } from '../validators/diagnosis.validator.js';
-import { resolveTrustedApplianceIdentity } from './ai/appliance-identity.js';
+import type { ResearchCacheDto, ResearchDto } from '../validators/research.validator.js';
+import { hasTrustedModel, resolveTrustedApplianceIdentity, type TrustedApplianceIdentity } from './ai/appliance-identity.js';
 import { runDiagnosisTurn } from './ai/orchestrator.js';
+import { assessUserSafety, restrictedFollowUpWindow } from './ai/safety.js';
 import { extractCandidateCodes, searchErrorCodes } from './knowledge.service.js';
 import { searchReplacementParts } from './parts.service.js';
+import {
+  buildResearchAnchorKey,
+  buildResearchKey,
+  isResearchEnabled,
+  researchApplianceIssue,
+  summarizeResearch,
+} from './research.service.js';
 
 async function requireOwnedSession(userId: string, sessionId: string) {
   const session = await prisma.diagnosisSession.findFirst({
@@ -81,7 +90,64 @@ function toTurnDto(userMessage: MessageDto, assistantMessage: MessageDto): TurnD
     ...(metadata.progress.followUpQuestion ? { followUpQuestion: metadata.progress.followUpQuestion } : {}),
     ...(metadata.knowledge ? { knowledge: metadata.knowledge } : {}),
     ...(metadata.parts ? { parts: metadata.parts } : {}),
+    ...(metadata.troubleshooting ? { troubleshooting: metadata.troubleshooting } : {}),
+    ...(metadata.research ? { research: metadata.research } : {}),
+    ...(metadata.safety ? { safety: metadata.safety } : {}),
     citations: metadata.citations,
+  };
+}
+
+type TurnResearch = {
+  research?: ResearchDto;
+  cache?: ResearchCacheDto;
+  reused: boolean;
+};
+
+// One bounded research operation per turn, reused while its key is unchanged.
+// The key covers brand, trusted model, the session's persisted user-entered
+// error code and the symptom, so new identity or symptom information triggers
+// fresh research. An UNAVAILABLE result is retried on the next turn. Research
+// is advisory: any failure degrades to UNAVAILABLE, never a failed turn.
+async function resolveTurnResearch(
+  identity: TrustedApplianceIdentity,
+  session: { errorCode: string | null; symptom: string | null },
+  fallbackSymptom: string,
+  cached: ResearchCacheDto | undefined,
+): Promise<TurnResearch> {
+  if (!isResearchEnabled()) return { reused: false };
+
+  const query = {
+    brand: identity.brand,
+    // Only a trusted, unconflicted model may anchor model-specific research.
+    modelNumber: hasTrustedModel(identity) ? identity.modelNumber : null,
+    // The persisted session error code only; never inferred from free text.
+    errorCode: session.errorCode,
+    symptom: session.symptom ?? fallbackSymptom,
+  };
+  const key = buildResearchKey(query);
+  const anchorKey = buildResearchAnchorKey(query);
+  if (!key || !anchorKey) return { reused: false };
+
+  const reusable = cached && cached.result.status !== 'UNAVAILABLE';
+  // A legacy session (no persisted symptom) researches with the current
+  // message, which differs every turn. It reuses the cache while brand, model,
+  // error code and classification are unchanged instead of re-researching on
+  // every turn.
+  const legacyMatch = session.symptom === null && cached?.anchorKey === anchorKey;
+  if (reusable && (cached.key === key || legacyMatch)) {
+    return { research: cached.result, cache: cached, reused: true };
+  }
+
+  let research: ResearchDto;
+  try {
+    research = await researchApplianceIssue(query);
+  } catch {
+    research = { status: 'UNAVAILABLE', confidence: 'INSUFFICIENT', results: [] };
+  }
+  return {
+    research,
+    cache: { version: 1, key, anchorKey, researchedAt: new Date().toISOString(), result: research },
+    reused: false,
   };
 }
 
@@ -134,40 +200,16 @@ export async function sendMessage(
 }
 
 /*
-Verifies the user owns the diagnosis session.
-
-
-
-Checks whether the session is still open.
-
-
-
-Checks whether this request was already processed.
-
-
-
-Retrieves conversation history.
-
-
-
-Establishes trusted appliance identity.
-
-
-
-Searches the knowledge base for relevant error codes.
-
-
-
-Runs the AI diagnosis and tool-calling loop.
-
-
-
-Saves the user message, AI response, and updated diagnosis context.
-
-
-
-Protects against concurrent requests and database conflicts.
-
+Turn flow:
+1. Verify ownership, open status and requestId replay.
+2. Retrieve bounded history and establish trusted appliance identity.
+3. Check user-reported hazards (sticky across turns). A hazard skips research.
+4. Run one bounded research operation when enabled, or reuse the cache.
+5. Search the knowledge base for relevant error codes.
+6. Run the Gemini tool loop with research as untrusted evidence; backend
+   policy validates the outcome, safety and evidence wording.
+7. Persist the user message, assistant turn and context in one conditional
+   transaction, protected against concurrent requests.
 */
 async function performSendMessage(
   userId: string,
@@ -184,6 +226,7 @@ async function performSendMessage(
       status: true,
       context: true,
       errorCode: true,
+      symptom: true,
       updatedAt: true,
       appliance: { select: { category: true, brand: true, modelNumber: true } },
     },
@@ -210,6 +253,21 @@ async function performSendMessage(
     take: env.GEMINI_HISTORY_LIMIT,
   });
   const history = historyRows.reverse().map(toMessageDto);
+  // I3: the restricted follow-up window after a refused dangerous request is
+  // counted in USER turns and loaded separately, so it does not depend on
+  // GEMINI_HISTORY_LIMIT or on how many assistant messages sit in between.
+  const restrictionWindow = restrictedFollowUpWindow(env.SAFETY_FOLLOW_UP_USER_TURNS);
+  const restrictionRows = await prisma.message.findMany({
+    where: { sessionId: session.id, role: MessageRole.USER },
+    select: messageDtoSelect,
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: restrictionWindow,
+  });
+  const restrictionUserHistory = [...restrictionRows]
+    .reverse()
+    .filter((message) => message.role === MessageRole.USER)
+    .map((message) => message.content)
+    .slice(-restrictionWindow);
 
   // Resolve identity before any provider or knowledge work. Only the fresh DB
   // appliance and USER-authored messages are inputs; assistant history and AI
@@ -238,14 +296,37 @@ async function performSendMessage(
     env.ALLOW_UNREVIEWED_KNOWLEDGE,
   );
 
+  // Immediate hazards are decided by the backend before any external call:
+  // when one is active, research is skipped and the orchestrator answers with
+  // a backend-written safety response.
+  const hazardActive =
+    assessUserSafety({
+      userContent: input.content,
+      history,
+      restrictionUserHistory,
+      restrictionWindow,
+      context,
+    }).length > 0;
+  const turnResearch = hazardActive
+    ? { reused: false }
+    : await resolveTurnResearch(
+        identity,
+        { errorCode: session.errorCode, symptom: session.symptom ?? null },
+        input.content,
+        context.research,
+      );
+
   const result = await runDiagnosisTurn({
     identity,
-    context,
+    context: turnResearch.cache ? { ...context, research: turnResearch.cache } : context,
     history,
+    restrictionUserHistory,
+    sessionErrorCode: session.errorCode,
     userContent: input.content,
     knowledge,
     includeUnreviewed: env.ALLOW_UNREVIEWED_KNOWLEDGE,
     partsSearch: searchReplacementParts,
+    ...(turnResearch.research ? { research: turnResearch.research } : {}),
   });
 
   const fixChallenge = result.issueFixChallenge ? randomUUID() : undefined;
@@ -263,6 +344,11 @@ async function performSendMessage(
     },
     knowledge: result.knowledge,
     ...(result.parts ? { parts: result.parts } : {}),
+    ...(result.troubleshooting ? { troubleshooting: result.troubleshooting } : {}),
+    ...(turnResearch.research && !result.safety
+      ? { research: summarizeResearch(turnResearch.research, turnResearch.reused) }
+      : {}),
+    ...(result.safety ? { safety: result.safety } : {}),
     citations: result.citations,
   };
 

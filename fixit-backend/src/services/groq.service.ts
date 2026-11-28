@@ -98,9 +98,9 @@ function toHttpError(error: unknown): HttpError {
   return new HttpError(502, 'AI_INVALID_RESPONSE', 'AI provider returned an invalid response');
 }
 
-async function request(params: CompletionParams): Promise<Completion> {
+async function request(params: CompletionParams, timeoutMs: number): Promise<Completion> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), env.GROQ_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const completion = await getClient().chat.completions.create(params, {
       signal: controller.signal,
@@ -120,16 +120,37 @@ export type CompletionDiagnostics = {
   toolChoice?: unknown;
 };
 
+// Per-call bounds. Callers on a latency-sensitive path pass their own
+// per-attempt timeout. `timeoutMs` is clamped to 1..120000 ms; it may be
+// shorter or longer than GROQ_TIMEOUT_MS. `maxRetries` can only lower
+// GROQ_MAX_RETRIES, never raise it. A timed-out attempt or a 5xx counts as
+// retryable, so the worst case for one call is
+// (1 + effective retries) x timeoutMs. Research passes maxRetries: 0 (one
+// attempt of RESEARCH_TIMEOUT_MS). The parts lookup passes only its timeout,
+// so it keeps GROQ_MAX_RETRIES: by default 2 x PARTS_TIMEOUT_MS = 20 s.
+export type CompletionOptions = {
+  timeoutMs?: number;
+  maxRetries?: number;
+};
+
+function boundedInt(value: number | undefined, fallback: number, max: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.min(Math.trunc(value), max));
+}
+
 export async function createChatCompletion(
   params: CompletionParams,
   diagnostics?: CompletionDiagnostics,
+  options?: CompletionOptions,
 ): Promise<Completion> {
+  const timeoutMs = Math.max(1, boundedInt(options?.timeoutMs, env.GROQ_TIMEOUT_MS, 120_000));
+  const maxRetries = boundedInt(options?.maxRetries, env.GROQ_MAX_RETRIES, env.GROQ_MAX_RETRIES);
   let attempt = 0;
   while (true) {
     try {
-      return await request(params);
+      return await request(params, timeoutMs);
     } catch (error) {
-      if (attempt < env.GROQ_MAX_RETRIES && isRetryable(error)) {
+      if (attempt < maxRetries && isRetryable(error)) {
         attempt += 1;
         continue;
       }

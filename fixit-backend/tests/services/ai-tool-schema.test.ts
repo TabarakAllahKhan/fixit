@@ -40,6 +40,7 @@ const OUTCOME_PROPERTIES = [
   'diagnosticFacts',
   'component',
   'partNumber',
+  'troubleshootingSteps',
 ];
 
 const outcomeTool = geminiToolsAsLegacy.find(

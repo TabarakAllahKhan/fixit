@@ -1,6 +1,14 @@
+import { createHash } from 'node:crypto';
 import { env } from '../config/env.js';
 import { createChatCompletion } from './groq.service.js';
 import { extractBrowserResults, type BrowserResult } from '../utils/groqBrowserResponse.js';
+import {
+  isOfficialManufacturerHost,
+  manufacturerMappingFingerprint,
+  mentionsBrand,
+  mentionsOtherBrand,
+  normalizeBrandKey,
+} from '../utils/manufacturerDomains.js';
 import { containsExactToken } from '../utils/textMatching.js';
 import {
   canonicalUrlKey,
@@ -17,6 +25,7 @@ import {
   type ResearchRelevance,
   type ResearchResultDto,
   type ResearchSourceKind,
+  type ResearchSummaryDto,
   type ResearchTrust,
 } from '../validators/research.validator.js';
 
@@ -312,29 +321,47 @@ export type ResearchEvidenceInput = {
   hasTrustedModel: boolean;
   relevance: ResearchRelevance;
   contradicted: boolean;
+  // Whether the evidence text names the appliance's own brand, and whether it
+  // names a different known brand. Short error codes (E1, F21) are shared by
+  // many manufacturers with unrelated meanings, so an error-code-only match on
+  // an independent reference counts only when the page is about this brand.
+  // Omitted values are treated as "not associated" (fail closed).
+  brandMentioned?: boolean;
+  otherBrandMentioned?: boolean;
 };
 
 // Backend-owned classification. Provider labels and model narrative play no
 // part in these decisions.
+//
+// - MANUFACTURER_CONFIRMED: the appliance brand's own official domain, a
+//   trusted exact model anchor, direct relevance and no contradiction.
+// - THIRD_PARTY_SUPPORTED: a credible allowlisted reference that directly
+//   matches the exact model, or that matches the exact error code on a page
+//   about this brand and no other; or the brand's own official information
+//   without exact-model confirmation.
+// - WEAK: everything else, including any page from a different manufacturer
+//   and any error-code-only match on a page that is not clearly about this
+//   brand.
 export function classifyResearchEvidence(input: ResearchEvidenceInput): ResearchConfidence {
   if (input.contradicted) return 'WEAK';
-  if (
-    input.trust === 'MANUFACTURER' &&
-    input.hasTrustedModel &&
-    input.exactModelMatch &&
-    input.relevance === 'DIRECT'
-  ) {
+  if (input.trust === 'OTHER_MANUFACTURER') return 'WEAK';
+  if (input.relevance !== 'DIRECT') return 'WEAK';
+  if (input.trust === 'MANUFACTURER' && input.hasTrustedModel && input.exactModelMatch) {
     return 'MANUFACTURER_CONFIRMED';
   }
-  if (
-    input.trust === 'TECHNICAL_REFERENCE' &&
-    input.relevance === 'DIRECT' &&
-    (input.exactModelMatch || input.exactErrorCodeMatch)
-  ) {
-    return 'THIRD_PARTY_SUPPORTED';
+  if (input.exactModelMatch) return 'THIRD_PARTY_SUPPORTED';
+  if (input.exactErrorCodeMatch) {
+    // The brand's own official domain is inherently about this brand.
+    if (input.trust === 'MANUFACTURER') return 'THIRD_PARTY_SUPPORTED';
+    const brandAssociated = input.brandMentioned === true && input.otherBrandMentioned !== true;
+    return brandAssociated ? 'THIRD_PARTY_SUPPORTED' : 'WEAK';
   }
   return 'WEAK';
 }
+
+// Bumped whenever classification rules change, so a cached result computed
+// under older rules is never reused as if it had the current tier.
+export const RESEARCH_CLASSIFIER_VERSION = 2;
 
 function configFromEnv(): ResearchConfig {
   return {
@@ -396,10 +423,19 @@ function buildResearchResults(
     const relevance = relevanceOf(evidenceText, tokens, exactErrorCodeMatch, exactModelMatch);
     if (relevance === 'UNRELATED') continue;
 
-    const manufacturer = matchAllowedDomain(group.validated.hostname, config.manufacturerDomains);
-    const trust: ResearchTrust = manufacturer ? 'MANUFACTURER' : 'TECHNICAL_REFERENCE';
+    // The flat allowlist only says a host may be fetched. Manufacturer trust
+    // requires the reviewed brand mapping to name this host for this brand.
+    const trust: ResearchTrust = isOfficialManufacturerHost(group.validated.hostname, input.brand)
+      ? 'MANUFACTURER'
+      : matchAllowedDomain(group.validated.hostname, config.manufacturerDomains)
+        ? 'OTHER_MANUFACTURER'
+        : 'TECHNICAL_REFERENCE';
     const contradicted = hasContradiction(evidenceText, input.modelNumber, input.errorCode);
     const sourceKind: ResearchSourceKind = snippetResult ? snippetResult.kind : titleResult.kind;
+    // Brand association is read from the retrieved title and snippet only,
+    // never from the URL path, which is easy to make look relevant.
+    const brandMentioned = mentionsBrand(evidenceText, input.brand);
+    const otherBrandMentioned = mentionsOtherBrand(evidenceText, input.brand);
 
     results.push({
       title,
@@ -418,6 +454,8 @@ function buildResearchResults(
         hasTrustedModel: Boolean(input.modelNumber),
         relevance,
         contradicted,
+        brandMentioned,
+        otherBrandMentioned,
       }),
     });
   }
@@ -510,6 +548,11 @@ export async function researchApplianceIssue(raw: ResearchQueryInput): Promise<R
       // Best-effort hint only. Phase 2A showed include_domains is not enforced;
       // the backend allowlist below is the actual trust boundary.
       search_settings: { include_domains: domainHint },
+    }, undefined, {
+      // One bounded attempt: research is advisory and sits on the turn's
+      // critical path, so a slow or failing provider is never retried.
+      timeoutMs: env.RESEARCH_TIMEOUT_MS,
+      maxRetries: 0,
     });
   } catch {
     // groq.service already maps and logs provider failures safely. Research is
@@ -523,4 +566,103 @@ export async function researchApplianceIssue(raw: ResearchQueryInput): Promise<R
     config,
   );
   return finalize(results, config);
+}
+
+export function isResearchEnabled(): boolean {
+  return env.RESEARCH_PROVIDER === 'groq_browser';
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+// Everything besides the query itself that decides a cached result's tiers:
+// the classifier rules, the reviewed brand -> domain mapping and the
+// configured allowlists. A change to any of them invalidates cached results.
+function classificationVersion(): string {
+  return sha256(
+    JSON.stringify({
+      classifier: RESEARCH_CLASSIFIER_VERSION,
+      mapping: manufacturerMappingFingerprint(),
+      manufacturerDomains: parseAllowedDomains(env.RESEARCH_MANUFACTURER_DOMAINS),
+      technicalDomains: parseAllowedDomains(env.RESEARCH_TECHNICAL_DOMAINS),
+    }),
+  );
+}
+
+function identityParts(input: NormalizedResearchInput) {
+  return {
+    brand: normalizeBrandKey(input.brand),
+    model: input.modelNumber ? input.modelNumber.toUpperCase().replace(/[\s._-]+/g, '') : null,
+    errorCode: input.errorCode ?? null,
+  };
+}
+
+// Cache identity for one research operation: brand, trusted model, the
+// session's persisted error code, a hash of the symptom and the
+// classification version. Inputs are normalized exactly as the provider
+// query is, so cosmetic differences (case, spacing, line breaks) reuse the
+// same result. Returns null when the input is not researchable at all.
+export function buildResearchKey(raw: ResearchQueryInput): string | null {
+  const input = normalizeResearchInput(raw);
+  if (!input) return null;
+  const symptom = input.symptom.toLowerCase().replace(/\s+/g, ' ').trim();
+  return sha256(
+    JSON.stringify({
+      v: 2,
+      ...identityParts(input),
+      symptom: sha256(symptom),
+      classification: classificationVersion(),
+    }),
+  );
+}
+
+// The same identity without the symptom. Legacy sessions have no persisted
+// symptom, so their research symptom is the current message, which changes
+// on every turn; they reuse cached research while this anchor is unchanged
+// instead of researching again on every turn.
+export function buildResearchAnchorKey(raw: ResearchQueryInput): string | null {
+  const input = normalizeResearchInput(raw);
+  if (!input) return null;
+  return sha256(
+    JSON.stringify({ v: 2, anchor: true, ...identityParts(input), classification: classificationVersion() }),
+  );
+}
+
+// Bounded, client-visible view of a research result. Contradicted entries are
+// omitted; every listed source keeps its backend-derived tier.
+export function summarizeResearch(research: ResearchDto, reused: boolean): ResearchSummaryDto {
+  return {
+    status: research.status,
+    confidence: research.confidence,
+    reused,
+    sources: research.results
+      .filter((result) => !result.contradicted)
+      .slice(0, 5)
+      .map((result) => ({
+        title: boundText(result.title, 200),
+        url: result.url,
+        trust: result.trust,
+        confidence: result.confidence,
+      })),
+  };
+}
+
+// Valid manufacturer evidence for the claim guard. `exactModel` additionally
+// requires MANUFACTURER_CONFIRMED (official page that matches the trusted
+// model); otherwise any uncontradicted, directly relevant page on the brand's
+// own official domain counts as general manufacturer information.
+export function hasManufacturerEvidence(
+  research: ResearchDto | undefined,
+  options: { exactModel: boolean },
+): boolean {
+  if (!research) return false;
+  return research.results.some(
+    (result) =>
+      !result.contradicted &&
+      result.trust === 'MANUFACTURER' &&
+      (options.exactModel
+        ? result.confidence === 'MANUFACTURER_CONFIRMED'
+        : result.confidence === 'MANUFACTURER_CONFIRMED' || result.confidence === 'THIRD_PARTY_SUPPORTED'),
+  );
 }

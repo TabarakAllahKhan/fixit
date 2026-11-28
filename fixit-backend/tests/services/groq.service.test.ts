@@ -101,6 +101,50 @@ describe('createChatCompletion', () => {
     expect(createMock).toHaveBeenCalledTimes(1);
   });
 
+  it('allows a caller to disable retries for a single bounded attempt', async () => {
+    env.GROQ_MAX_RETRIES = 2;
+    createMock.mockRejectedValueOnce({ status: 503 }).mockResolvedValueOnce(success);
+
+    await expect(createChatCompletion(params as never, undefined, { maxRetries: 0 })).rejects.toMatchObject({
+      statusCode: 503,
+      code: 'AI_PROVIDER_UNAVAILABLE',
+    });
+    expect(createMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never lets a caller exceed the configured retry bound', async () => {
+    env.GROQ_MAX_RETRIES = 1;
+    createMock.mockRejectedValue({ status: 503 });
+
+    await expect(createChatCompletion(params as never, undefined, { maxRetries: 5 })).rejects.toMatchObject({
+      code: 'AI_PROVIDER_UNAVAILABLE',
+    });
+    expect(createMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts at the caller-supplied timeout and maps it to AI_TIMEOUT', async () => {
+    vi.useFakeTimers();
+    try {
+      createMock.mockImplementationOnce(
+        (_params: unknown, options: { signal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            options.signal.addEventListener('abort', () =>
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+            );
+          }),
+      );
+
+      const pending = createChatCompletion(params as never, undefined, { timeoutMs: 8_000, maxRetries: 0 });
+      const assertion = expect(pending).rejects.toMatchObject({ statusCode: 504, code: 'AI_TIMEOUT' });
+      await vi.advanceTimersByTimeAsync(7_999);
+      expect(createMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not expose provider errors or API keys', async () => {
     createMock.mockRejectedValueOnce(new Error(`failed with key ${env.GROQ_API_KEY}`));
 

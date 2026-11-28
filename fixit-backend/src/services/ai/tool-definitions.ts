@@ -98,7 +98,7 @@ export const diagnosisTools: readonly AiFunctionDeclaration[] = [
   ),
   declaration(
     'submit_diagnosis_outcome',
-    'Finish the turn with the user-facing reply and proposed diagnostic state. Always use this tool instead of plain final text. reply and outcome are mandatory; omit optional fields that do not apply (or send null). Use NEEDS_CLARIFICATION while safe checks remain; reserve TECHNICIAN_REQUIRED for immediate hazards or confirmed professional-only work. Never include dangerous repair instructions in reply or followUpQuestion.',
+    'Finish the turn with the user-facing reply and proposed diagnostic state. Always use this tool instead of plain final text. reply and outcome are mandatory; omit optional fields that do not apply (or send null). Use READY_FOR_CONFIRMATION only after giving concrete safe troubleshootingSteps the user can try and then report back on; never use FIXED (only the user can confirm a fix). Use NEEDS_CLARIFICATION while information is missing; reserve TECHNICIAN_REQUIRED for immediate hazards or confirmed professional-only work. Never include dangerous repair instructions in reply, followUpQuestion or troubleshootingSteps.',
     // Only reply/outcome are truly required. Gemini must be able to omit the
     // nullable optional arguments; Zod remains the authority for every supplied
     // value, type and bound.
@@ -131,7 +131,14 @@ export const diagnosisTools: readonly AiFunctionDeclaration[] = [
         },
         partNumber: {
           type: 'string',
-          description: 'Known part number, or null/omitted when unknown.',
+          description:
+            'Part number only when a backend tool result or knowledge record supplied it, or null/omitted when unknown. Never guess one.',
+        },
+        troubleshootingSteps: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Up to 8 concrete, safe, non-invasive steps the user can do now (settings, cleaning accessible filters, checking the door is latched, resetting a tripped breaker), or null/omitted when none. Required for READY_FOR_CONFIRMATION unless approved repair steps were returned or the user reports the problem is solved. Never include opening panels, live electrical, gas, refrigerant or safety-device work.',
         },
       },
       required: ['reply', 'outcome'],

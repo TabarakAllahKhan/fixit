@@ -238,7 +238,7 @@ describe('runDiagnosisTurn policy', () => {
     });
   });
 
-  it('ignores null part fields when recording the parts query', async () => {
+  it('does not accept NEEDS_PART without a named component, even with a trusted model', async () => {
     const trustedIdentity = identity({
       appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
     });
@@ -261,7 +261,8 @@ describe('runDiagnosisTurn policy', () => {
 
     const result = await runDiagnosisTurn(input({ identity: trustedIdentity }));
 
-    expect(result.progress.outcome).toBe('NEEDS_PART');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
+    expect(result.progress.verdict).toBeNull();
     expect(result.nextContext.lastPartsQuery).toBeUndefined();
   });
 
@@ -282,15 +283,16 @@ describe('runDiagnosisTurn policy', () => {
     expect(result.knowledge.repairSteps).toEqual([]);
   });
 
-  it('never accepts an AI FIXED claim without an approved repair sequence', async () => {
+  it('never accepts an unsupported AI FIXED claim or issues a challenge for it', async () => {
     createInteractionMock.mockResolvedValueOnce(
       completion('submit_diagnosis_outcome', { reply: 'It is fixed.', outcome: 'FIXED' }),
     );
 
     const result = await runDiagnosisTurn(input());
 
-    expect(result.progress.outcome).toBe('UNRESOLVED');
-    expect(result.progress.verdict).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
+    expect(result.progress.verdict).toBeNull();
+    expect(result.progress.followUpQuestion).toBeDefined();
     expect(result.issueFixChallenge).toBe(false);
   });
 
@@ -337,7 +339,11 @@ describe('runDiagnosisTurn policy', () => {
   });
 
   it('keeps backend parts classification and citations, never AI compatibility', async () => {
-    const partsSearch = vi.fn().mockResolvedValue(partsResult);
+    const evidencedParts: PartsDto = {
+      ...partsResult,
+      candidates: [{ ...partsResult.candidates[0]!, compatibility: 'POSSIBLE_MATCH' }],
+    };
+    const partsSearch = vi.fn().mockResolvedValue(evidencedParts);
     const trustedIdentity = identity({
       appliance: { category: 'WASHING_MACHINE', brand: 'TestBrand', modelNumber: 'MODEL-1' },
     });
@@ -353,7 +359,11 @@ describe('runDiagnosisTurn policy', () => {
         completion('submit_diagnosis_outcome', { reply: 'Here are part listings.', outcome: 'NEEDS_PART' }, 'call-2'),
       );
 
-    const result = await runDiagnosisTurn(input({ identity: trustedIdentity, partsSearch }));
+    // Parts candidates never justify a replacement on their own (I3); the
+    // user's damage report about the same component does.
+    const result = await runDiagnosisTurn(
+      input({ identity: trustedIdentity, partsSearch, userContent: 'The drain pump housing is cracked' }),
+    );
 
     expect(partsSearch).toHaveBeenCalledWith({
       brand: 'TestBrand',
@@ -361,8 +371,11 @@ describe('runDiagnosisTurn policy', () => {
       modelSource: 'APPLIANCE',
       component: 'drain pump',
     });
-    expect(result.parts).toEqual(partsResult);
+    expect(result.parts).toEqual(evidencedParts);
     expect(result.progress.verdict).toBe('NEEDS_PART');
+    // POSSIBLE_MATCH is not VERIFIED, so the backend says so explicitly.
+    expect(result.reply).toMatch(/has not been verified/i);
+    expect(result.nextContext.lastPartsQuery).toMatchObject({ component: 'drain pump', modelNumberUsed: 'MODEL-1' });
     expect(result.citations).toEqual(
       expect.arrayContaining([expect.objectContaining({ sourceKind: 'SEARCH_RESULT' })]),
     );
@@ -510,7 +523,10 @@ describe('runDiagnosisTurn policy', () => {
 
     expect(result.parts).toMatchObject({ candidates: [] });
     expect(result.parts?.note).toMatch(/currently unavailable/i);
-    expect(result.progress.verdict).toBe('NEEDS_PART');
+    // No parts, research, knowledge or prior-check evidence: not a part verdict.
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
+    expect(result.progress.verdict).toBeNull();
+    expect(result.reply).toMatch(/safe checks are needed/i);
   });
 
   it('sends bounded stateless history and a forced tool choice', async () => {
@@ -580,7 +596,7 @@ describe('get_repair_steps backend code resolution', () => {
     const result = await runRepairStepsCall('WW80T3040WW', knowledgeWithCodes({ code: 'FE' }));
 
     expect(getRepairStepsMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
     expect(result.knowledge.repairSteps).toEqual([]);
@@ -603,7 +619,7 @@ describe('get_repair_steps backend code resolution', () => {
       false,
     );
     expect(getRepairStepsMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
   });
@@ -614,7 +630,7 @@ describe('get_repair_steps backend code resolution', () => {
 
     expect(searchErrorCodesMock).toHaveBeenCalledWith(expect.anything(), [code], false);
     expect(getRepairStepsMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
   });
@@ -623,7 +639,7 @@ describe('get_repair_steps backend code resolution', () => {
     const result = await runRepairStepsCall('ZZZ', knowledgeWithCodes({ code: 'FE' }));
 
     expect(getRepairStepsMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
   });
@@ -703,7 +719,7 @@ describe('get_repair_steps backend code resolution', () => {
     const result = await runRepairStepsCall('FE', knowledge);
 
     expect(getRepairStepsMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
   });
@@ -717,8 +733,8 @@ describe('get_repair_steps backend code resolution', () => {
 
     const result = await runRepairStepsCall('FE', knowledgeWithCodes({ code: 'FE' }));
 
-    expect(result.progress.outcome).toBe('UNRESOLVED');
-    expect(result.progress.verdict).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
+    expect(result.progress.verdict).toBeNull();
     expect(result.issueFixChallenge).toBe(false);
     expect(result.knowledge.repairSteps).toEqual([]);
   });
@@ -855,24 +871,26 @@ describe('runDiagnosisTurn tool-loop safety', () => {
     });
   });
 
-  it('uses a safe deterministic turn when the forced final tool call is missing', async () => {
+  it('uses a neutral clarification turn when the forced final tool call is missing', async () => {
     createInteractionMock
       .mockResolvedValueOnce(completion('search_error_codes', { codes: ['FE'] }, 'call-search'))
       .mockRejectedValueOnce(new ForcedToolNotCalledError());
 
     const result = await runDiagnosisTurn(input());
 
-    expect(result.reply).toMatch(/could not complete a verified diagnosis/i);
+    // Not an unsupported KB-based UNRESOLVED verdict: the user can retry.
+    expect(result.reply).toMatch(/describe the problem again/i);
     expect(result.progress).toMatchObject({
       status: 'OPEN',
-      verdict: 'UNRESOLVED',
-      outcome: 'UNRESOLVED',
+      verdict: null,
+      outcome: 'NEEDS_CLARIFICATION',
     });
+    expect(result.progress.followUpQuestion).toBeDefined();
     expect(result.knowledge.repairSteps).toEqual([]);
     expect(result.citations).toEqual([]);
     expect(result.issueFixChallenge).toBe(false);
     expect(result.errorCodeId).toBeUndefined();
-    expect(result.nextContext.currentOutcome).toBe('UNRESOLVED');
+    expect(result.nextContext.currentOutcome).toBe('NEEDS_CLARIFICATION');
     expect(JSON.stringify(result)).not.toContain('to=functions.json');
   });
 
@@ -904,7 +922,7 @@ describe('runDiagnosisTurn tool-loop safety', () => {
     expect(result.knowledge.repairSteps).toEqual([]);
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
   });
 
   it('does not use the fallback when the missing tool call is outside the forced final round', async () => {

@@ -4,7 +4,7 @@ export const openApiSpec = {
     title: 'FixIt API',
     version: '1.0.0',
     description:
-      'HTTP API for the FixIt mobile app and backend diagnosis workflow. Responses use a standard envelope: success `{ "success": true, "data": ... }`, errors `{ "success": false, "error": { "code", "message" } }`. Diagnosis endpoints require a bearer access token. Send messages with a client-generated requestId to get an idempotent AI-powered turn; approved knowledge, safety checks, parts evidence, verdicts and confirmation remain backend-controlled.',
+      'HTTP API for the FixIt mobile app and backend diagnosis workflow. Responses use a standard envelope: success `{ "success": true, "data": ... }`, errors `{ "success": false, "error": { "code", "message" } }`. Diagnosis endpoints require a bearer access token. Send messages with a client-generated requestId to get an idempotent AI-powered turn; approved knowledge, safety checks, optional web-research evidence tiers, parts evidence, verdicts and confirmation remain backend-controlled. Immediate hazards return a backend-written safety response without calling the AI or research providers.',
   },
   servers: [
     {
@@ -339,6 +339,81 @@ export const openApiSpec = {
             type: 'string',
             enum: ['MANUAL', 'MANUFACTURER_PAGE', 'OTHER', 'TEST_FIXTURE', 'SEARCH_RESULT'],
           },
+          confidence: {
+            allOf: [{ $ref: '#/components/schemas/ResearchConfidence' }],
+            description: 'Present on web-research citations only. Wording must match this tier.',
+          },
+        },
+      },
+      ResearchConfidence: {
+        type: 'string',
+        enum: ['MANUFACTURER_CONFIRMED', 'THIRD_PARTY_SUPPORTED', 'WEAK', 'INSUFFICIENT'],
+        description:
+          'Backend-derived evidence tier. MANUFACTURER_CONFIRMED requires the appliance brand\'s own official domain (reviewed mapping), an exact trusted model match, direct relevance and no contradiction. THIRD_PARTY_SUPPORTED is a credible reference matching the exact model or error code, or official brand information without exact-model confirmation. WEAK may only suggest possibilities and general safe checks.',
+      },
+      ResearchSummarySourceDto: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title', 'url', 'trust', 'confidence'],
+        properties: {
+          title: { type: 'string', maxLength: 200 },
+          url: { type: 'string', format: 'uri' },
+          trust: {
+            type: 'string',
+            enum: ['MANUFACTURER', 'OTHER_MANUFACTURER', 'TECHNICAL_REFERENCE'],
+            description:
+              'MANUFACTURER only for the appliance brand\'s own official domain; OTHER_MANUFACTURER is a different brand\'s site and is never more than WEAK evidence.',
+          },
+          confidence: { $ref: '#/components/schemas/ResearchConfidence' },
+        },
+      },
+      ResearchSummaryDto: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'Bounded summary of the single optional web-research operation for this turn. Research is untrusted evidence and never overrides identity, safety or outcome rules. reused is true when an unchanged research key reused cached results.',
+        required: ['status', 'confidence', 'reused', 'sources'],
+        properties: {
+          status: { type: 'string', enum: ['COMPLETED', 'NO_EVIDENCE', 'UNAVAILABLE'] },
+          confidence: { $ref: '#/components/schemas/ResearchConfidence' },
+          reused: { type: 'boolean' },
+          sources: { type: 'array', items: { $ref: '#/components/schemas/ResearchSummarySourceDto' }, maxItems: 5 },
+        },
+      },
+      TroubleshootingDto: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'General safe troubleshooting proposed by the AI and checked by backend safety rules. Not approved knowledge (see KnowledgeDto.repairSteps). evidence is the research tier available for this turn.',
+        required: ['steps', 'evidence'],
+        properties: {
+          steps: { type: 'array', items: { type: 'string', maxLength: 500 }, minItems: 1, maxItems: 8 },
+          evidence: { $ref: '#/components/schemas/ResearchConfidence' },
+        },
+      },
+      SafetyCategory: {
+        type: 'string',
+        enum: [
+          'GAS',
+          'FIRE_SMOKE',
+          'ELECTRICAL',
+          'REFRIGERANT',
+          'WATER_ELECTRICAL',
+          'UNVERIFIED_HAZARD',
+          'UNSAFE_REQUEST',
+          'UNSAFE_MODEL_INSTRUCTION',
+        ],
+        description:
+          'UNVERIFIED_HAZARD means persisted safety state could not be read back and is kept active (fail closed). UNSAFE_REQUEST and UNSAFE_MODEL_INSTRUCTION apply to the turn in which they occur.',
+      },
+      SafetyDto: {
+        type: 'object',
+        additionalProperties: false,
+        description:
+          'Present when a backend-written, category-specific safety response replaced the AI answer. The outcome is TECHNICIAN_REQUIRED. User-reported physical hazards stay active for the rest of the session; a request for dangerous work is refused in its own turn.',
+        required: ['categories'],
+        properties: {
+          categories: { type: 'array', items: { $ref: '#/components/schemas/SafetyCategory' }, minItems: 1, maxItems: 8 },
         },
       },
       ErrorCodeKnowledgeDto: {
@@ -412,7 +487,8 @@ export const openApiSpec = {
           followUpQuestion: { type: 'string', maxLength: 1000 },
           fixChallenge: {
             type: 'string',
-            description: 'Single-use challenge issued with READY_FOR_CONFIRMATION; submit to /confirm.',
+            description:
+              'Single-use challenge issued with READY_FOR_CONFIRMATION, only when meaningful safe troubleshooting (approved steps or new troubleshooting steps) or a user-reported resolution exists. Submit to /confirm; FIXED is never set without it.',
           },
           fixChallengeExpiresAt: { type: 'string', format: 'date-time' },
         },
@@ -427,6 +503,9 @@ export const openApiSpec = {
           progress: { $ref: '#/components/schemas/DiagnosisProgressDto' },
           knowledge: { $ref: '#/components/schemas/KnowledgeDto' },
           parts: { $ref: '#/components/schemas/PartsDto' },
+          troubleshooting: { $ref: '#/components/schemas/TroubleshootingDto' },
+          research: { $ref: '#/components/schemas/ResearchSummaryDto' },
+          safety: { $ref: '#/components/schemas/SafetyDto' },
           citations: { type: 'array', items: { $ref: '#/components/schemas/CitationDto' }, maxItems: 20 },
         },
       },
@@ -473,6 +552,9 @@ export const openApiSpec = {
           followUpQuestion: { type: 'string', maxLength: 1000 },
           knowledge: { $ref: '#/components/schemas/KnowledgeDto' },
           parts: { $ref: '#/components/schemas/PartsDto' },
+          troubleshooting: { $ref: '#/components/schemas/TroubleshootingDto' },
+          research: { $ref: '#/components/schemas/ResearchSummaryDto' },
+          safety: { $ref: '#/components/schemas/SafetyDto' },
           citations: { type: 'array', items: { $ref: '#/components/schemas/CitationDto' }, maxItems: 20 },
         },
       },

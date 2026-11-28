@@ -181,7 +181,8 @@ describe('get_repair_steps resolution through real backend knowledge search', ()
       expect.objectContaining({ where: expect.objectContaining({ brand: 'TestBrand' }) }),
     );
     expect(getApprovedRepairSequenceMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    // An unsupported readiness claim is a clarification, not a terminal verdict.
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.issueFixChallenge).toBe(false);
   });
 
@@ -191,7 +192,8 @@ describe('get_repair_steps resolution through real backend knowledge search', ()
     const result = await callRepairSteps('FE');
 
     expect(getApprovedRepairSequenceMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    // An unsupported readiness claim is a clarification, not a terminal verdict.
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.issueFixChallenge).toBe(false);
   });
 
@@ -201,7 +203,8 @@ describe('get_repair_steps resolution through real backend knowledge search', ()
     const result = await callRepairSteps('FE');
 
     expect(getApprovedRepairSequenceMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    // An unsupported readiness claim is a clarification, not a terminal verdict.
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.issueFixChallenge).toBe(false);
   });
 
@@ -214,7 +217,8 @@ describe('get_repair_steps resolution through real backend knowledge search', ()
     const result = await callRepairSteps('FE');
 
     expect(getApprovedRepairSequenceMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    // An unsupported readiness claim is a clarification, not a terminal verdict.
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.issueFixChallenge).toBe(false);
   });
 
@@ -224,7 +228,8 @@ describe('get_repair_steps resolution through real backend knowledge search', ()
     const result = await callRepairSteps('ZZ');
 
     expect(getApprovedRepairSequenceMock).not.toHaveBeenCalled();
-    expect(result.progress.outcome).toBe('UNRESOLVED');
+    // An unsupported readiness claim is a clarification, not a terminal verdict.
+    expect(result.progress.outcome).toBe('NEEDS_CLARIFICATION');
     expect(result.errorCodeId).toBeUndefined();
     expect(result.issueFixChallenge).toBe(false);
   });

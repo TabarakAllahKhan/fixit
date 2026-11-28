@@ -14,7 +14,10 @@ import {
   type DiagnosisProgressDto,
   type KnowledgeDto,
   type PartsDto,
+  type SafetyDto,
+  type TroubleshootingDto,
 } from '../validators/ai.validator.js';
+import type { ResearchSummaryDto } from '../validators/research.validator.js';
 
 // Responses select only these columns. Unrelated fields are not even loaded
 // for a response query.
@@ -71,6 +74,12 @@ export type TurnDto = {
   followUpQuestion?: string;
   knowledge?: KnowledgeDto;
   parts?: PartsDto;
+  // AI-proposed, backend safety-checked steps; never approved knowledge.
+  troubleshooting?: TroubleshootingDto;
+  // Bounded summary of the turn's web research with evidence tiers.
+  research?: ResearchSummaryDto;
+  // Present when a backend safety response replaced the AI answer.
+  safety?: SafetyDto;
   citations?: CitationDto[];
 };
 

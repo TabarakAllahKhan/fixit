@@ -73,6 +73,10 @@ export const envSchema = z
     GEMINI_MAX_TOOL_ROUNDS: z.coerce.number().int().min(1).max(5).default(2),
     GEMINI_MAX_TOOL_CALLS: z.coerce.number().int().min(1).max(10).default(3),
     GEMINI_HISTORY_LIMIT: z.coerce.number().int().min(1).max(50).default(12),
+    // Restricted follow-up window after a refused dangerous request, counted
+    // in prior USER turns and independent of GEMINI_HISTORY_LIMIT. The safety
+    // module never uses fewer than 6 turns, whatever is configured here.
+    SAFETY_FOLLOW_UP_USER_TURNS: z.coerce.number().int().min(1).max(50).default(6),
 
     FIX_CONFIRMATION_TTL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(600),
     // Disabled by default. Enable only for controlled browser-search testing.
@@ -85,6 +89,10 @@ export const envSchema = z
         'samsung.com,lg.com,whirlpool.com,bosch-home.com,bosch.com,haier.com,partselect.com,repairclinic.com,appliancepartspros.com,searspartsdirect.com',
       ),
     PARTS_MAX_RESULTS: z.coerce.number().int().min(1).max(10).default(5),
+    // Per-attempt timeout for the optional parts lookup. The lookup keeps
+    // GROQ_MAX_RETRIES, and a timed-out attempt is retried, so its worst case
+    // is (1 + GROQ_MAX_RETRIES) x PARTS_TIMEOUT_MS (20 s with the defaults).
+    PARTS_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(60_000).default(10_000),
 
     // Backend web research is opt-in and disabled by default. Groq browser
     // search is the only supported provider; it reuses the validated Groq
@@ -96,8 +104,11 @@ export const envSchema = z
       .trim()
       .min(1)
       .max(2_000)
+      // Fetch allowlist only. Whether a host is the appliance's own
+      // manufacturer is decided by the reviewed brand mapping in
+      // utils/manufacturerDomains.ts, never by membership in this list.
       .default(
-        'samsung.com,lg.com,whirlpool.com,bosch-home.com,bosch.com,haier.com,geappliances.com,whirlpool.ca',
+        'samsung.com,lg.com,whirlpool.com,bosch-home.com,bosch.com,haier.com,geappliances.com,whirlpool.ca,miele.com,electrolux.com,frigidaire.com,maytag.com,kitchenaid.com,daikin.com,rheem.com,aosmith.com,panasonic.com,global.sharp,sharpusa.com,beko.com',
       ),
     RESEARCH_TECHNICAL_DOMAINS: z
       .string()
@@ -109,6 +120,9 @@ export const envSchema = z
     RESEARCH_MAX_TITLE_LENGTH: z.coerce.number().int().min(20).max(500).default(160),
     RESEARCH_MAX_SNIPPET_LENGTH: z.coerce.number().int().min(40).max(2_000).default(360),
     RESEARCH_MAX_SERIALIZED_BYTES: z.coerce.number().int().min(1_000).max(100_000).default(20_000),
+    // Single-attempt budget for the one bounded research call per diagnosis
+    // turn. Research is advisory, so it is never retried.
+    RESEARCH_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(30_000).default(8_000),
 
     // Development-only access to UNREVIEWED knowledge. Rejected in production.
     ALLOW_UNREVIEWED_KNOWLEDGE: booleanFromEnv,

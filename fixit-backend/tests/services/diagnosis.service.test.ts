@@ -483,3 +483,73 @@ describe('confirmFix and completeSession', () => {
     );
   });
 });
+
+describe('restricted follow-up window loading (I3, third remediation)', () => {
+  function row(role: MessageRole, content: string, index: number) {
+    return {
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      sessionId,
+      role,
+      content,
+      createdAt: new Date(Date.UTC(2026, 10, 28, 0, index)),
+      metadata: null,
+    };
+  }
+
+  it('loads the last six USER turns separately from the Gemini history and passes the session error code', async () => {
+    prisma.diagnosisSession.findFirst.mockResolvedValue(openSession({ errorCode: 'OE' }));
+    // Newest first, as the database query orders them.
+    const userTurns = Array.from({ length: 6 }, (_, i) => row(MessageRole.USER, `user turn ${6 - i}`, 20 - i));
+    const mixedHistory = [row(MessageRole.ASSISTANT, 'assistant reply', 30), row(MessageRole.USER, 'user turn 6', 20)];
+    prisma.message.findMany.mockImplementation(async ({ where }: { where: { role?: MessageRole } }) =>
+      where.role === MessageRole.USER ? userTurns : mixedHistory,
+    );
+
+    await sendMessage('user-1', { id: sessionId }, { requestId, content: 'What now?' });
+
+    expect(prisma.message.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { sessionId, role: MessageRole.USER }, take: 6 }),
+    );
+    const call = runDiagnosisTurnMock.mock.calls[0]![0] as {
+      history: unknown[];
+      restrictionUserHistory: string[];
+      sessionErrorCode: string | null;
+    };
+    expect(call.history).toHaveLength(2);
+    expect(call.restrictionUserHistory).toEqual([
+      'user turn 1',
+      'user turn 2',
+      'user turn 3',
+      'user turn 4',
+      'user turn 5',
+      'user turn 6',
+    ]);
+    expect(call.sessionErrorCode).toBe('OE');
+  });
+
+  it('refuses a follow-up to a dangerous request that is outside the Gemini history but inside the user-turn window', async () => {
+    const userTurns = [
+      row(MessageRole.USER, 'The drum is still noisy.', 25),
+      row(MessageRole.USER, 'The drum is still noisy.', 24),
+      row(MessageRole.USER, 'The drum is still noisy.', 23),
+      row(MessageRole.USER, 'The drum is still noisy.', 22),
+      row(MessageRole.USER, 'The drum is still noisy.', 21),
+      row(MessageRole.USER, 'How do I discharge the capacitor in my microwave?', 20),
+    ];
+    prisma.message.findMany.mockImplementation(async ({ where }: { where: { role?: MessageRole } }) =>
+      where.role === MessageRole.USER ? userTurns : [],
+    );
+    const { assessUserSafety } = await import('../../src/services/ai/safety.js');
+
+    await sendMessage('user-1', { id: sessionId }, { requestId, content: 'What tool would I need for that?' });
+
+    const call = runDiagnosisTurnMock.mock.calls[0]![0] as {
+      history: Array<{ role: string; content: string }>;
+      restrictionUserHistory: string[];
+      userContent: string;
+      context: { safety?: { activeCategories: [] } };
+    };
+    expect(call.history).toEqual([]);
+    expect(assessUserSafety({ ...call, restrictionWindow: 6 })).toEqual(['UNSAFE_REQUEST']);
+  });
+});

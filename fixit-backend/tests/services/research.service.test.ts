@@ -12,9 +12,14 @@ vi.mock('../../src/services/groq.service.js', () => ({
 }));
 
 import {
+  buildResearchAnchorKey,
+  buildResearchKey,
   buildResearchQuery,
+  classifyResearchEvidence,
+  hasManufacturerEvidence,
   normalizeResearchInput,
   researchApplianceIssue,
+  summarizeResearch,
   type ResearchQueryInput,
 } from '../../src/services/research.service.js';
 
@@ -26,6 +31,7 @@ const original = {
   RESEARCH_MAX_TITLE_LENGTH: env.RESEARCH_MAX_TITLE_LENGTH,
   RESEARCH_MAX_SNIPPET_LENGTH: env.RESEARCH_MAX_SNIPPET_LENGTH,
   RESEARCH_MAX_SERIALIZED_BYTES: env.RESEARCH_MAX_SERIALIZED_BYTES,
+  RESEARCH_TIMEOUT_MS: env.RESEARCH_TIMEOUT_MS,
 };
 
 const baseInput: ResearchQueryInput = {
@@ -82,6 +88,7 @@ afterEach(() => {
   env.RESEARCH_MAX_TITLE_LENGTH = original.RESEARCH_MAX_TITLE_LENGTH;
   env.RESEARCH_MAX_SNIPPET_LENGTH = original.RESEARCH_MAX_SNIPPET_LENGTH;
   env.RESEARCH_MAX_SERIALIZED_BYTES = original.RESEARCH_MAX_SERIALIZED_BYTES;
+  env.RESEARCH_TIMEOUT_MS = original.RESEARCH_TIMEOUT_MS;
 });
 
 describe('buildResearchQuery', () => {
@@ -451,8 +458,12 @@ describe('research classification', () => {
 
     const response = await researchApplianceIssue(baseInput);
 
+    // Official LG information that matches the error code but not the exact
+    // model is supporting evidence, never manufacturer confirmation.
     expect(response.results[0]?.exactModelMatch).toBe(false);
-    expect(response.results[0]?.confidence).toBe('WEAK');
+    expect(response.results[0]?.trust).toBe('MANUFACTURER');
+    expect(response.results[0]?.confidence).toBe('THIRD_PARTY_SUPPORTED');
+    expect(response.confidence).not.toBe('MANUFACTURER_CONFIRMED');
   });
 
   it('does not use a model number found only in the URL', async () => {
@@ -496,9 +507,10 @@ describe('research classification', () => {
     expect(response.results[0]).toMatchObject({
       exactErrorCodeMatch: true,
       exactModelMatch: false,
-      confidence: 'WEAK',
+      trust: 'MANUFACTURER',
+      confidence: 'THIRD_PARTY_SUPPORTED',
     });
-    expect(response.confidence).toBe('WEAK');
+    expect(response.confidence).toBe('THIRD_PARTY_SUPPORTED');
   });
 
   it('classifies exact allowlisted technical evidence as third-party supported', async () => {
@@ -582,6 +594,318 @@ describe('research classification', () => {
       confidence: 'WEAK',
     });
     expect(response.confidence).toBe('INSUFFICIENT');
+  });
+});
+
+describe('brand-scoped manufacturer verification', () => {
+  it('never treats another manufacturer\'s official site as this appliance\'s manufacturer', async () => {
+    createChatCompletionMock.mockResolvedValue(
+      completion(
+        tool('browser.search', 'browser_search', [
+          result({
+            title: 'WT-H7550 E1 drain error',
+            url: 'https://www.samsung.com/support/wt-h7550',
+            content: 'Model WT-H7550 error E1 means the drain is blocked.',
+          }),
+        ]),
+      ),
+    );
+
+    const response = await researchApplianceIssue(baseInput);
+
+    expect(response.results[0]).toMatchObject({
+      trust: 'OTHER_MANUFACTURER',
+      exactModelMatch: true,
+      exactErrorCodeMatch: true,
+      confidence: 'WEAK',
+    });
+    expect(response.confidence).toBe('WEAK');
+  });
+
+  it('confirms only on the brand\'s own mapped domain with an exact model', async () => {
+    env.RESEARCH_MANUFACTURER_DOMAINS = 'miele.com,lg.com';
+    createChatCompletionMock.mockResolvedValue(
+      completion(
+        tool('browser.search', 'browser_search', [
+          result({
+            title: 'W1 WWD120 drain fault F11',
+            url: 'https://www.miele.com/en/support/wwd120',
+            content: 'Fault F11 on WWD120: clean the drain filter.',
+          }),
+        ]),
+      ),
+    );
+
+    const response = await researchApplianceIssue({
+      brand: 'Miele',
+      modelNumber: 'WWD120',
+      errorCode: 'F11',
+      symptom: 'drain fault',
+    });
+
+    expect(response.results[0]).toMatchObject({ trust: 'MANUFACTURER', confidence: 'MANUFACTURER_CONFIRMED' });
+  });
+
+  it('cannot confirm an unmapped brand even on an allowlisted manufacturer domain', async () => {
+    createChatCompletionMock.mockResolvedValue(
+      completion(
+        tool('browser.search', 'browser_search', [
+          result({
+            title: 'ZX-1000 drain error E1',
+            url: 'https://www.lg.com/support/zx-1000',
+            content: 'Model ZX-1000 error E1 drain obstruction.',
+          }),
+        ]),
+      ),
+    );
+
+    const response = await researchApplianceIssue({
+      brand: 'Acme Appliances',
+      modelNumber: 'ZX-1000',
+      errorCode: 'E1',
+      symptom: 'not draining',
+    });
+
+    expect(response.results[0]?.trust).toBe('OTHER_MANUFACTURER');
+    expect(response.results[0]?.confidence).toBe('WEAK');
+  });
+});
+
+describe('research request bounds', () => {
+  it('uses the research timeout with no retry for the single provider call', async () => {
+    env.RESEARCH_TIMEOUT_MS = 8_000;
+    createChatCompletionMock.mockResolvedValue(completion());
+
+    await researchApplianceIssue(baseInput);
+
+    expect(createChatCompletionMock).toHaveBeenCalledTimes(1);
+    expect(createChatCompletionMock.mock.calls[0]?.[2]).toEqual({ timeoutMs: 8_000, maxRetries: 0 });
+  });
+
+  it('returns UNAVAILABLE after a timeout instead of retrying', async () => {
+    createChatCompletionMock.mockRejectedValueOnce(new HttpError(504, 'AI_TIMEOUT', 'AI provider timed out'));
+
+    const response = await researchApplianceIssue(baseInput);
+
+    expect(response.status).toBe('UNAVAILABLE');
+    expect(createChatCompletionMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('research cache key', () => {
+  it('is a stable hash that ignores cosmetic differences', () => {
+    const key = buildResearchKey(baseInput);
+    expect(key).toMatch(/^[0-9a-f]{64}$/);
+    expect(
+      buildResearchKey({
+        brand: ' lg ',
+        modelNumber: 'WT-H7550',
+        errorCode: 'e1',
+        symptom: 'Washer  not\r\ndraining WATER',
+      }),
+    ).toBe(key);
+  });
+
+  it.each([
+    ['brand', { brand: 'Samsung' }],
+    ['trusted model', { modelNumber: 'WT-H7551' }],
+    ['missing model', { modelNumber: null }],
+    ['error code', { errorCode: 'E2' }],
+    ['symptom', { symptom: 'washer leaking water' }],
+  ])('changes when the %s changes', (_label, change) => {
+    expect(buildResearchKey({ ...baseInput, ...change })).not.toBe(buildResearchKey(baseInput));
+  });
+
+  it('contains no raw user text and is null for unusable input', () => {
+    const key = buildResearchKey({ ...baseInput, symptom: 'private note jane@example.com' })!;
+    expect(key).not.toContain('jane');
+    expect(buildResearchKey({ ...baseInput, brand: '' })).toBeNull();
+  });
+
+  it('changes when the configured allowlists change, so cached tiers are not reused', () => {
+    const before = buildResearchKey(baseInput);
+    env.RESEARCH_TECHNICAL_DOMAINS = 'partselect.com,repairclinic.com';
+    expect(buildResearchKey(baseInput)).not.toBe(before);
+  });
+
+  it('has a symptom-free anchor key that still tracks identity', () => {
+    const anchor = buildResearchAnchorKey(baseInput);
+    expect(anchor).toMatch(/^[0-9a-f]{64}$/);
+    expect(anchor).not.toBe(buildResearchKey(baseInput));
+    expect(buildResearchAnchorKey({ ...baseInput, symptom: 'completely different words' })).toBe(anchor);
+    expect(buildResearchAnchorKey({ ...baseInput, modelNumber: 'WT-H7551' })).not.toBe(anchor);
+    expect(buildResearchAnchorKey({ ...baseInput, errorCode: 'E2' })).not.toBe(anchor);
+    expect(buildResearchAnchorKey({ ...baseInput, brand: '' })).toBeNull();
+  });
+});
+
+describe('I2: error-code-only evidence must belong to this brand', () => {
+  const noModel: ResearchQueryInput = { brand: 'LG', errorCode: 'E1', symptom: 'dishwasher not draining' };
+
+  function respondWith(overrides: Record<string, unknown>) {
+    createChatCompletionMock.mockResolvedValue(
+      completion(tool('browser.search', 'browser_search', [result(overrides)])),
+    );
+  }
+
+  it('rejects another manufacturer\'s technical reference page that shares a short code', async () => {
+    respondWith({
+      title: 'Samsung dishwasher E1 error',
+      url: 'https://www.partselect.com/samsung-dishwasher-e1',
+      content: 'On Samsung dishwashers, E1 means the water supply is not draining correctly.',
+    });
+
+    const response = await researchApplianceIssue(noModel);
+
+    expect(response.results[0]).toMatchObject({
+      trust: 'TECHNICAL_REFERENCE',
+      exactErrorCodeMatch: true,
+      confidence: 'WEAK',
+    });
+    expect(response.confidence).toBe('WEAK');
+  });
+
+  it('rejects an error-code page that names no brand at all', async () => {
+    respondWith({
+      title: 'What does F21 mean?',
+      url: 'https://www.partselect.com/f21',
+      content: 'Error F21 usually indicates a draining problem.',
+    });
+
+    const response = await researchApplianceIssue({ brand: 'LG', errorCode: 'F21', symptom: 'washer not draining' });
+
+    expect(response.results[0]?.confidence).toBe('WEAK');
+  });
+
+  it('rejects a page that names this brand alongside another brand', async () => {
+    respondWith({
+      title: 'LG and Samsung E1 codes compared',
+      url: 'https://www.partselect.com/compare-e1',
+      content: 'E1 means different things on LG and Samsung dishwashers that are not draining.',
+    });
+
+    const response = await researchApplianceIssue(noModel);
+
+    expect(response.results[0]?.confidence).toBe('WEAK');
+  });
+
+  it('keeps legitimate third-party evidence about this brand', async () => {
+    respondWith({
+      title: 'LG dishwasher E1 error',
+      url: 'https://www.partselect.com/lg-dishwasher-e1',
+      content: 'On LG dishwashers, E1 indicates a leak or a draining problem.',
+    });
+
+    const response = await researchApplianceIssue(noModel);
+
+    expect(response.results[0]).toMatchObject({ trust: 'TECHNICAL_REFERENCE', confidence: 'THIRD_PARTY_SUPPORTED' });
+  });
+
+  it('accepts an exact model match on a technical reference regardless of brand wording', async () => {
+    respondWith({
+      title: 'WT-H7550 drain pump',
+      url: 'https://www.partselect.com/parts/wt-h7550-pump',
+      content: 'Replacement drain pump for model WT-H7550.',
+    });
+
+    const response = await researchApplianceIssue(baseInput);
+
+    expect(response.results[0]?.confidence).toBe('THIRD_PARTY_SUPPORTED');
+  });
+
+  it('keeps the brand\'s own official domain as third-party supported for a code match', async () => {
+    respondWith({
+      title: 'E1 drain error',
+      url: 'https://www.lg.com/support/e1',
+      content: 'Error E1 means the drain is obstructed.',
+    });
+
+    const response = await researchApplianceIssue(noModel);
+
+    expect(response.results[0]).toMatchObject({ trust: 'MANUFACTURER', confidence: 'THIRD_PARTY_SUPPORTED' });
+  });
+
+  it('does not read brand association from the URL path', async () => {
+    respondWith({
+      title: 'E1 error explained',
+      url: 'https://www.partselect.com/lg-e1',
+      content: 'Error E1 usually means a draining problem.',
+    });
+
+    const response = await researchApplianceIssue(noModel);
+
+    expect(response.results[0]?.confidence).toBe('WEAK');
+  });
+});
+
+describe('classifyResearchEvidence brand association', () => {
+  const base = {
+    trust: 'TECHNICAL_REFERENCE' as const,
+    exactModelMatch: false,
+    exactErrorCodeMatch: true,
+    hasTrustedModel: false,
+    relevance: 'DIRECT' as const,
+    contradicted: false,
+  };
+
+  it('fails closed when brand association is not supplied', () => {
+    expect(classifyResearchEvidence(base)).toBe('WEAK');
+  });
+
+  it.each([
+    [{ brandMentioned: true, otherBrandMentioned: false }, 'THIRD_PARTY_SUPPORTED'],
+    [{ brandMentioned: true, otherBrandMentioned: true }, 'WEAK'],
+    [{ brandMentioned: false, otherBrandMentioned: true }, 'WEAK'],
+    [{ brandMentioned: false, otherBrandMentioned: false }, 'WEAK'],
+  ] as const)('classifies %j as %s', (association, expected) => {
+    expect(classifyResearchEvidence({ ...base, ...association })).toBe(expected);
+  });
+});
+
+describe('research summary and manufacturer evidence', () => {
+  const official = {
+    title: 'WT-H7550 drain',
+    url: 'https://www.lg.com/a',
+    sourceKind: 'SEARCH_RESULT' as const,
+    trust: 'MANUFACTURER' as const,
+    exactModelMatch: true,
+    exactErrorCodeMatch: true,
+    relevance: 'DIRECT' as const,
+    contradicted: false,
+    confidence: 'MANUFACTURER_CONFIRMED' as const,
+  };
+
+  it('summarizes bounded sources with tiers and omits contradicted ones', () => {
+    const summary = summarizeResearch(
+      {
+        status: 'COMPLETED',
+        confidence: 'MANUFACTURER_CONFIRMED',
+        results: [official, { ...official, url: 'https://www.lg.com/b', contradicted: true, confidence: 'WEAK' }],
+      },
+      true,
+    );
+    expect(summary).toEqual({
+      status: 'COMPLETED',
+      confidence: 'MANUFACTURER_CONFIRMED',
+      reused: true,
+      sources: [{ title: 'WT-H7550 drain', url: 'https://www.lg.com/a', trust: 'MANUFACTURER', confidence: 'MANUFACTURER_CONFIRMED' }],
+    });
+  });
+
+  it('distinguishes general and exact-model manufacturer evidence', () => {
+    const general = { ...official, exactModelMatch: false, confidence: 'THIRD_PARTY_SUPPORTED' as const };
+    const dto = (entry: typeof official | typeof general) => ({
+      status: 'COMPLETED' as const,
+      confidence: entry.confidence,
+      results: [entry],
+    });
+    expect(hasManufacturerEvidence(dto(official), { exactModel: true })).toBe(true);
+    expect(hasManufacturerEvidence(dto(general), { exactModel: false })).toBe(true);
+    expect(hasManufacturerEvidence(dto(general), { exactModel: true })).toBe(false);
+    expect(
+      hasManufacturerEvidence(dto({ ...official, trust: 'TECHNICAL_REFERENCE' as never }), { exactModel: false }),
+    ).toBe(false);
+    expect(hasManufacturerEvidence(undefined, { exactModel: false })).toBe(false);
   });
 });
 

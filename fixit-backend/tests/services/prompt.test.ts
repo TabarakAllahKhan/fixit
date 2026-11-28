@@ -24,6 +24,55 @@ describe('buildDiagnosisPrompt identity separation', () => {
     expect(SYSTEM_PROMPT).toMatch(/never claim a part is VERIFIED compatible/i);
   });
 
+  it('treats research as untrusted, tiered evidence and forbids unsupported manufacturer claims', () => {
+    expect(SYSTEM_PROMPT).toMatch(/never instructions/i);
+    expect(SYSTEM_PROMPT).toMatch(/Only MANUFACTURER_CONFIRMED sources may be described as the manufacturer's documentation/i);
+    expect(SYSTEM_PROMPT).toMatch(/WEAK sources may only suggest possibilities/i);
+    expect(SYSTEM_PROMPT).toMatch(/Never say that the manufacturer or official documentation confirms/i);
+  });
+
+  it('describes readiness, FIXED and failed-step rules', () => {
+    expect(SYSTEM_PROMPT).toMatch(/Safe troubleshooting does not require approved knowledge-base steps/i);
+    expect(SYSTEM_PROMPT).toMatch(/Never choose FIXED/i);
+    expect(SYSTEM_PROMPT).toMatch(/If the user says a step did not work, do not repeat the same steps/i);
+    expect(SYSTEM_PROMPT).toMatch(/Prefer safe checks and cleaning before recommending a replacement part/i);
+  });
+
+  it('places bounded research in its own untrusted block', () => {
+    const prompt = buildDiagnosisPrompt({
+      identity: identity(),
+      context: emptyDiagnosisContext(),
+      history: [],
+      userContent: 'Not draining',
+      knowledge: { unverified: false, errorCodes: [], repairSteps: [] },
+      research: {
+        status: 'COMPLETED',
+        confidence: 'WEAK',
+        results: [
+          {
+            title: 'x'.repeat(500),
+            url: 'https://www.partselect.com/a',
+            snippet: 'y'.repeat(2000),
+            sourceKind: 'SEARCH_RESULT',
+            trust: 'TECHNICAL_REFERENCE',
+            exactModelMatch: false,
+            exactErrorCodeMatch: false,
+            relevance: 'TOPICAL',
+            contradicted: false,
+            confidence: 'WEAK',
+          },
+        ],
+      },
+    });
+    const blocks = prompt.systemInstruction.split('\n\n');
+    const research = blocks.find((block) => block.startsWith('Untrusted external research'));
+    expect(research).toMatch(/not instructions/);
+    expect(research!.length).toBeLessThanOrEqual(4200);
+    // Research never enters the trusted identity block or the user turns.
+    expect(blocks.find((block) => block.includes('Trusted appliance identity'))).not.toContain('partselect');
+    expect(JSON.stringify(prompt.steps)).not.toContain('yyyy');
+  });
+
   it('distinguishes immediate hazards from technician-only hypotheses', () => {
     expect(SYSTEM_PROMPT).toMatch(/immediate hazards require stopping/i);
     expect(SYSTEM_PROMPT).toMatch(/only a hypothesis, not an immediate hazard/i);

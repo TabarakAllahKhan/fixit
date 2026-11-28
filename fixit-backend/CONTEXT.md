@@ -27,6 +27,14 @@ Gemini diagnosis was tested manually through Swagger. Groq remains solely the op
 to Gemini, and this decision does not enable or verify live `groq_browser` discovery (see §9
 and §12.4).
 
+**2026-11-28 Phase 2C + 2D (approved by the user after independent review):** optional Groq
+research, the backend safety classifier (`src/services/ai/safety.ts`; categories `GAS`,
+`FIRE_SMOKE`, `ELECTRICAL`, `REFRIGERANT`, `WATER_ELECTRICAL`, `UNVERIFIED_HAZARD`,
+`UNSAFE_REQUEST`, `UNSAFE_MODEL_INSTRUCTION`), the outcome gate and evidence guards were added
+after this document's last full audit. The root `CURRENT_STATUS.md` (operational state) and
+`PROJECT_PLAN.md` (approved behaviour) are the source of truth for that work; sections below
+that predate it describe the earlier state.
+
 ## 2. Stack
 
 | Concern        | Choice                                                              |
@@ -324,6 +332,7 @@ finished migrations. Do not apply this or any migration to production; only the 
 | `GOOGLE_API_KEY` | `src/services/ai/provider.ts` via `env` | backend-only Gemini credential; optional in development/test, **required in production**; never logged |
 | `GEMINI_MODEL` | `src/services/ai/provider.ts` | locked to `gemini-3.5-flash-lite`; diagnosis must not switch provider or model through configuration |
 | `GEMINI_TIMEOUT_MS` / `GEMINI_MAX_OUTPUT_TOKENS` / `GEMINI_THINKING_LEVEL` / `GEMINI_MAX_TOOL_ROUNDS` / `GEMINI_MAX_TOOL_CALLS` / `GEMINI_HISTORY_LIMIT` | `src/services/ai/provider.ts` / `orchestrator.ts` / `diagnosis.service.ts` | bounded Gemini request and tool-loop settings; defaults `30000` / `3000` / `minimal` / `2` / `3` / `12` |
+| `SAFETY_FOLLOW_UP_USER_TURNS` | `diagnosis.service.ts` / `orchestrator.ts` / `src/services/ai/safety.ts` | restricted follow-up window after a refused dangerous request, counted in prior USER turns and independent of `GEMINI_HISTORY_LIMIT`; default `6`; accepted `1`–`50` but the safety module never uses fewer than 6 (`restrictedFollowUpWindow`) |
 | `GROQ_API_KEY` | `groq.service.ts`, opt-in parts browser search | backend-only credential for the optional `groq_browser` parts provider; optional in development/test, **required in production only when that provider is enabled**; empty/whitespace counts as absent; never logged |
 | `GROQ_MODEL`   | `groq.service.ts` / `parts.service.ts` | model id for the optional `groq_browser` parts provider only; **current default `openai/gpt-oss-20b`** (the historical Phase 2 diagnosis default was `openai/gpt-oss-120b`; see D3) |
 | `GROQ_TIMEOUT_MS` / `GROQ_MAX_RETRIES` / `GROQ_MAX_TOOL_ROUNDS` / `GROQ_MAX_TOOL_CALLS` / `GROQ_HISTORY_LIMIT` / `GROQ_MAX_COMPLETION_TOKENS` / `GROQ_REASONING_EFFORT` | optional Groq parts adapter (legacy diagnosis bounds retained for config compatibility) | `GROQ_TIMEOUT_MS` / `GROQ_MAX_RETRIES` are consumed by `groq.service.ts`; the tool-loop/history/token/effort variables remain schema-validated but are not used by the Gemini diagnosis flow. Defaults `15000` / `1` / `2` / `3` / `12` / `1200` / `low` |
@@ -1611,9 +1620,11 @@ only for the narrow provider rejection: the **forced final tool round** with HTT
 `tool_use_failed`, and a message containing `did not call a tool`. Other provider failures keep
 their existing mapped errors.
 
-On that exact signal, the backend generates a deterministic safe result: `UNRESOLVED` by
-default, escalation to `TECHNICIAN_REQUIRED` when hazard text is present, and removal of repair
-steps, citations, `errorCodeId`, and `issueFixChallenge`. This is a safety fallback, not a
+On that exact signal, the backend generates a deterministic safe result: originally
+`UNRESOLVED` by default; **since Phase 2C + 2D it is a neutral
+`NEEDS_CLARIFICATION` retry message** (see `CURRENT_STATUS.md`). Hazard text still escalates to
+`TECHNICIAN_REQUIRED`, and repair steps, citations, `errorCodeId`, and `issueFixChallenge` are
+still removed. This is a safety fallback, not a
 replacement diagnosis. It is covered by mocked tests in
 `tests/services/groq.service.test.ts` and `tests/services/orchestrator.test.ts`.
 

@@ -45,6 +45,7 @@ describe('environment schema', () => {
     expect(result.data.GEMINI_MAX_TOOL_ROUNDS).toBe(2);
     expect(result.data.GEMINI_MAX_TOOL_CALLS).toBe(3);
     expect(result.data.GEMINI_HISTORY_LIMIT).toBe(12);
+    expect(result.data.SAFETY_FOLLOW_UP_USER_TURNS).toBe(6);
     expect(result.data.GOOGLE_API_KEY).toBeUndefined();
     expect(result.data.FIX_CONFIRMATION_TTL_SECONDS).toBe(600);
     expect(result.data.PARTS_PROVIDER).toBe('none');
@@ -56,6 +57,12 @@ describe('environment schema', () => {
     expect(result.data.RESEARCH_MAX_TITLE_LENGTH).toBe(160);
     expect(result.data.RESEARCH_MAX_SNIPPET_LENGTH).toBe(360);
     expect(result.data.RESEARCH_MAX_SERIALIZED_BYTES).toBe(20_000);
+    expect(result.data.RESEARCH_TIMEOUT_MS).toBe(8_000);
+    expect(result.data.PARTS_TIMEOUT_MS).toBe(10_000);
+    for (const domain of ['miele.com', 'electrolux.com', 'frigidaire.com', 'maytag.com', 'kitchenaid.com',
+      'daikin.com', 'rheem.com', 'aosmith.com', 'panasonic.com', 'global.sharp', 'beko.com']) {
+      expect(result.data.RESEARCH_MANUFACTURER_DOMAINS).toContain(domain);
+    }
     expect(result.data.GROQ_API_KEY).toBeUndefined();
     expect(result.data.ALLOW_UNREVIEWED_KNOWLEDGE).toBe(false);
   });
@@ -123,6 +130,20 @@ describe('environment schema', () => {
     );
   });
 
+  it('configures the restricted follow-up window independently of the Gemini history', () => {
+    const wider = parseEnv({ ...baseEnv, SAFETY_FOLLOW_UP_USER_TURNS: '10', GEMINI_HISTORY_LIMIT: '4' });
+    expect(wider.success).toBe(true);
+    if (wider.success) {
+      expect(wider.data.SAFETY_FOLLOW_UP_USER_TURNS).toBe(10);
+      expect(wider.data.GEMINI_HISTORY_LIMIT).toBe(4);
+    }
+    // A smaller value parses, but the safety module clamps it to its
+    // six-turn minimum (see restrictedFollowUpWindow in safety.test.ts).
+    expect(parseEnv({ ...baseEnv, SAFETY_FOLLOW_UP_USER_TURNS: '2' }).success).toBe(true);
+    expect(failingPaths({ ...baseEnv, SAFETY_FOLLOW_UP_USER_TURNS: '0' })).toContain('SAFETY_FOLLOW_UP_USER_TURNS');
+    expect(failingPaths({ ...baseEnv, SAFETY_FOLLOW_UP_USER_TURNS: '100' })).toContain('SAFETY_FOLLOW_UP_USER_TURNS');
+  });
+
   it('validates bounded Groq limits and parts configuration', () => {
     const valid = parseEnv({
       ...baseEnv,
@@ -148,6 +169,10 @@ describe('environment schema', () => {
       'GROQ_REASONING_EFFORT',
     );
     expect(failingPaths({ ...baseEnv, PARTS_PROVIDER: 'google' })).toContain('PARTS_PROVIDER');
+    expect(failingPaths({ ...baseEnv, PARTS_TIMEOUT_MS: '500' })).toContain('PARTS_TIMEOUT_MS');
+    expect(failingPaths({ ...baseEnv, PARTS_TIMEOUT_MS: '120000' })).toContain('PARTS_TIMEOUT_MS');
+    expect(failingPaths({ ...baseEnv, RESEARCH_TIMEOUT_MS: '999' })).toContain('RESEARCH_TIMEOUT_MS');
+    expect(failingPaths({ ...baseEnv, RESEARCH_TIMEOUT_MS: '30001' })).toContain('RESEARCH_TIMEOUT_MS');
     expect(failingPaths({ ...baseEnv, FIX_CONFIRMATION_TTL_SECONDS: '1' })).toContain(
       'FIX_CONFIRMATION_TTL_SECONDS',
     );

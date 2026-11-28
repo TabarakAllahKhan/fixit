@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { openApiSpec } from '../../src/docs/openapi.js';
+import { safetyCategorySchema } from '../../src/services/ai/safety.js';
+import { troubleshootingDtoSchema } from '../../src/validators/ai.validator.js';
+import {
+  researchConfidenceSchema,
+  researchSummarySchema,
+  researchTrustSchema,
+} from '../../src/validators/research.validator.js';
 import {
   messageDtoSelect,
   sessionDtoSelect,
@@ -291,6 +298,35 @@ describe('response schemas match the DTO mappers', () => {
     expect(schema('PartCandidateDto').properties.compatibility.$ref).toBe(
       '#/components/schemas/Compatibility',
     );
+  });
+
+  it('documents Phase 2C/2D troubleshooting, research, safety and citation tiers', () => {
+    for (const name of ['TurnDto', 'AssistantMessageMetadataDto']) {
+      const properties = schema(name).properties;
+      expect(properties.troubleshooting.$ref).toBe('#/components/schemas/TroubleshootingDto');
+      expect(properties.research.$ref).toBe('#/components/schemas/ResearchSummaryDto');
+      expect(properties.safety.$ref).toBe('#/components/schemas/SafetyDto');
+      // Optional additions: older stored turns remain valid.
+      expect(schema(name).required).not.toContain('troubleshooting');
+      expect(schema(name).required).not.toContain('research');
+      expect(schema(name).required).not.toContain('safety');
+    }
+
+    expect(schema('ResearchConfidence').enum).toEqual(researchConfidenceSchema.options);
+    expect(schema('ResearchSummarySourceDto').properties.trust.enum).toEqual(researchTrustSchema.options);
+    expect(schema('SafetyCategory').enum).toEqual(safetyCategorySchema.options);
+    expect(Object.keys(schema('ResearchSummaryDto').properties).sort()).toEqual(
+      Object.keys(researchSummarySchema.shape).sort(),
+    );
+    expect(Object.keys(schema('TroubleshootingDto').properties).sort()).toEqual(
+      Object.keys(troubleshootingDtoSchema.shape).sort(),
+    );
+    expect(schema('TroubleshootingDto').description).toMatch(/not approved knowledge/i);
+    expect(schema('CitationDto').properties.confidence.allOf[0].$ref).toBe(
+      '#/components/schemas/ResearchConfidence',
+    );
+    expect(schema('ResearchConfidence').description).toMatch(/own official domain/i);
+    expect(schema('DiagnosisProgressDto').properties.fixChallenge.description).toMatch(/FIXED is never set/i);
   });
 
   it('documents the shared pagination envelope', () => {
